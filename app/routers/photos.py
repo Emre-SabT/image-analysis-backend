@@ -26,12 +26,22 @@ def _to_dict(photo, analysis):
     }
     if analysis:
         data.update({
-            "caption": analysis.caption,
-            "environment": analysis.environment,
-            "activity": analysis.activity,
+            "description": analysis.description,
+            "environment_type": analysis.environment_type,
             "people_count": analysis.people_count,
             "possible_event": analysis.possible_event,
-            "summary": analysis.summary,
+            "primary_object": analysis.primary_object,
+            "secondary_objects": analysis.secondary_objects,
+            "environment": analysis.environment,
+            "attributes": analysis.attributes,
+            "action": analysis.action,
+            "mood": analysis.mood,
+            "use_case": analysis.use_case,
+            "context": analysis.context,
+            "style": analysis.style,
+            "audience": analysis.audience,
+            "public_figures": analysis.public_figures,
+            "all_tags": analysis.all_tags,
             "model_name": analysis.model_name,
         })
     return data
@@ -69,4 +79,5 @@ def get_photo_file(photo_id: uuid.UUID, db: Session = Depends(get_db)):
     photo, _ = photo_service.get_photo_with_analysis(db, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Fotograf bulunamadi")
-    return FileResponse(photo.storage_path)
+    path, media_type = photo_service.get_servable_file(photo)
+    return FileResponse(path, media_type=media_type)

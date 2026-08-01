@@ -37,27 +37,66 @@ def _chat_url() -> str:
         return f"{base}/api/chat"
 
 
-PROMPT = """Bu fotoğrafı analiz et ve SADECE aşağıdaki JSON şemasında yanıt ver, başka hiçbir metin ekleme:
+PROMPT = """Sen bir görsel analiz ve medya metadata üretim uzmanısın. Bu fotoğrafı analiz et ve SADECE aşağıdaki JSON şemasında yanıt ver, başka hiçbir metin ekleme.
 
+Kurallar:
+- Tüm metin alanları HER ZAMAN Türkçe olmalı. Görselde İngilizce yazı, marka adı veya metin görsen bile açıklamaları Türkçe yaz. İngilizce kelime veya cümle kullanma.
+- Sadece fotoğrafta açıkça görülen veya güçlü şekilde çıkarılabilen bilgileri yaz; tahmine dayalı uydurma detay ekleme.
+- Gereksiz tekrar yapma, çok genel/boş etiketler ("fotoğraf", "görsel" gibi) kullanma.
+- description 1-2 cümle olsun.
+- primary_object, action, mood, use_case, possible_event tek string olmalı.
+- secondary_objects, environment, attributes, context, style, audience array olmalı; bilgi yoksa boş dizi döndür.
+- people_count HER ZAMAN bir tam sayı olmalı (örnek: 0, 3, 15, 40). Kalabalık veya net sayılamıyorsa yaklaşık bir tam sayı tahmin et (örn. 50). Asla "çok", "birçok", "hundreds" gibi bir kelime yazma.
+- public_figures sadece tanınmış veya kamusal açıdan önemli kişiler için doldurulmalı (sıradan/özel kişiler için değil). Bir kişiden emin değilsen name alanını boş string ("") yap, types alanını yine de doldurabilirsin. Aynı kişi tekrar etmemeli.
+- all_tags, description ve public_figures.name HARİÇ tüm alanların birleşiminden oluşmalı: primary_object, secondary_objects, environment, attributes, action, mood, use_case, context, style, audience, public_figures.types. Duplicate etiket kullanma, all_tags içine açıklama cümlesi ekleme.
+- Fotoğrafta ürün üzerinde okunabilir bir marka/metin varsa (ör. ambalaj, etiket, kutu üzerindeki yazı), açıklamanı o yazıya dayandır; yazıyla çelişen bir varsayımda bulunma (ör. kutunun üzerinde "kahve" yazıyorsa "bira" deme).
+
+JSON şeması:
 {
-  "caption": "kısa açıklama",
-  "environment": "indoor" veya "outdoor" veya "mixed",
-  "activity": "yapılan aktivite",
+  "description": "kısa açıklama (1-2 cümle)",
+  "environment_type": "indoor" veya "outdoor" veya "mixed",
   "people_count": sayı,
   "possible_event": "olası etkinlik türü",
-  "summary": "1-2 cümlelik özet"
+  "primary_object": "ana nesne veya odak",
+  "secondary_objects": ["ikincil nesneler"],
+  "environment": ["ortam/mekan etiketleri"],
+  "attributes": ["görsel öznitelikler (renk, ışık, kompozizyon vb.)"],
+  "action": "yapılan aktivite",
+  "mood": "atmosfer / ruh hali",
+  "use_case": "olası kullanım amacı",
+  "context": ["bağlamsal etiketler"],
+  "style": ["görsel/fotoğraf stili etiketleri"],
+  "audience": ["hedef kitle etiketleri"],
+  "public_figures": [
+    {"name": "isim veya boş string", "types": ["ör. sporcu, sanatçı, siyasetçi"]}
+  ],
+  "all_tags": ["tüm etiketlerin birleşimi"]
 }
+"""
 
-Önemli: people_count HER ZAMAN bir tam sayı olmalı (örnek: 3, 15, 40). Kalabalık veya net sayılamıyorsa yaklaşık bir tam sayı tahmin et (örn. 50). Asla "çok", "birçok", "hundreds" gibi bir kelime yazma."""
+
+class PublicFigure(BaseModel):
+    name: str = ""
+    types: list[str] = []
 
 
 class VLMResult(BaseModel):
-    caption: str
-    environment: Literal["indoor", "outdoor", "mixed"]
-    activity: str
+    description: str
+    environment_type: Literal["indoor", "outdoor", "mixed"]
     people_count: int
     possible_event: str
-    summary: str
+    primary_object: str
+    secondary_objects: list[str] = []
+    environment: list[str] = []
+    attributes: list[str] = []
+    action: str
+    mood: str
+    use_case: str
+    context: list[str] = []
+    style: list[str] = []
+    audience: list[str] = []
+    public_figures: list[PublicFigure] = []
+    all_tags: list[str] = []
 
     @field_validator("people_count", mode="before")
     @classmethod
@@ -70,17 +109,28 @@ class VLMResult(BaseModel):
         return v
 
 
+# JSON semasindaki aciklayici placeholder metinler -- model bunlari aynen
+# geri dondurursek "sablonu papagan gibi tekrarladi" olarak isaretleriz.
 _PLACEHOLDERS = {
-    "kısa açıklama",
-    "yapılan aktivite",
+    "kısa açıklama (1-2 cümle)",
     "olası etkinlik türü",
-    "1-2 cümlelik özet",
+    "ana nesne veya odak",
+    "yapılan aktivite",
+    "atmosfer / ruh hali",
+    "olası kullanım amacı",
 }
 
 
 def _is_placeholder_echo(result: VLMResult) -> bool:
     """Model, prompt'taki örnek metni olduğu gibi geri döndürdüyse tespit eder."""
-    fields = [result.caption, result.activity, result.possible_event, result.summary]
+    fields = [
+        result.description,
+        result.possible_event,
+        result.primary_object,
+        result.action,
+        result.mood,
+        result.use_case,
+    ]
     return sum(1 for f in fields if f.strip().lower() in _PLACEHOLDERS) >= 2
 
 
