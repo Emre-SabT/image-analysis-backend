@@ -2,39 +2,37 @@ import base64
 import io
 import re
 import zlib
+
+import boto3
 import httpx
 from pydantic import BaseModel, ValidationError, field_validator
 from typing import Literal
-from app.config import settings
+from app.core.settings import settings
 from PIL import Image, ImageOps
 import pillow_heif
 pillow_heif.register_heif_opener()
 
-# 1024 uzun kenar -> num_ctx=8192 icinde bol bol yer kalir (context tasmasi
-# hem HTTP 400'e hem de sessiz dejenere @@@@ ciktisina yol aciyordu).
-MAX_DIMENSION = 1024
-NUM_CTX = 8192
+# 768 uzun kenar (onceki: 1024) - GPU offload ile hiz testinde kucultmenin
+# ayrica vision-token sayisini (ve dolayisiyla hem sureyi hem KV-cache VRAM
+# ihtiyacini) dusurdugu olculdu. 1024'te tasma sorunu (HTTP 400 / dejenere
+# @@@@ ciktisi) 768'de de gecerliligini koruyor, bu yuzden ust sinir olarak
+# tutuluyor.
+MAX_DIMENSION = 768
 
-# Ollama ve LM Studio farkli API formatlari kullaniyor:
-#   - Ollama:     /api/chat          , content icinde ayri "images" alani
-#   - LM Studio:  /v1/chat/completions (OpenAI-uyumlu), content icinde
-#                 image_url bloklari, "options" alanini tanimiyor.
-# NOT: LM Studio'da context uzunlugu (num_ctx karsiligi) API'den degil,
-# modeli LM Studio arayuzunde yuklerken "Context Length" ayarindan verilir.
+# AI_PROVIDER'a gore iki cok farkli cagri yolu var:
+#   - lm_studio: yerel, OpenAI-uyumlu HTTP (/v1/chat/completions), httpx ile.
+#   - bedrock:   AWS Bedrock, boto3 ile (HTTP degil, AWS SDK cagrisi).
+# NOT (degisim gecmisi): Ollama destegi kaldirildi, yerine AWS Bedrock
+# eklendi - kullanicinin acik istegiyle.
 IS_LM_STUDIO = settings.AI_PROVIDER == "lm_studio"
 
 
 def _chat_url() -> str:
+    """Sadece LM Studio icin - Bedrock HTTP degil, boto3 uzerinden cagrilir."""
     base = settings.VLM_BASE_URL.rstrip("/")
-    if IS_LM_STUDIO:
-        # settings.VLM_BASE_URL zaten ".../v1" ile bitiyor olmali
-        if not base.endswith("/v1"):
-            base = base + "/v1"
-        return f"{base}/chat/completions"
-    else:
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        return f"{base}/api/chat"
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    return f"{base}/chat/completions"
 
 
 PROMPT = """Sen bir görsel analiz ve medya metadata üretim uzmanısın. Bu fotoğrafı analiz et ve SADECE aşağıdaki JSON şemasında yanıt ver, başka hiçbir metin ekleme.
@@ -78,6 +76,15 @@ JSON şeması:
 class PublicFigure(BaseModel):
     name: str = ""
     types: list[str] = []
+
+    @field_validator("types", mode="before")
+    @classmethod
+    def _coerce_types(cls, v):
+        # Model bazen diziyi "sanatci, oyuncu" gibi virgullu tek string olarak
+        # donduruyor; virgulle bolup listeye cevir.
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
 
 
 class VLMResult(BaseModel):
@@ -134,7 +141,9 @@ def _is_placeholder_echo(result: VLMResult) -> bool:
     return sum(1 for f in fields if f.strip().lower() in _PLACEHOLDERS) >= 2
 
 
-def _encode_image(image_path: str) -> str:
+def _encode_image(image_path: str) -> bytes:
+    """JPEG bayt dizisi dondurur (Bedrock'un Converse API'si ham bayt bekler;
+    LM Studio icin gerektiginde base64'e ayrica cevrilir - bkz. _call_vlm_lm_studio)."""
     with Image.open(image_path) as img:
         # EXIF rotasyonunu piksele uygula (yoksa yan yatmis fotolar goruluyor)
         img = ImageOps.exif_transpose(img)
@@ -142,7 +151,7 @@ def _encode_image(image_path: str) -> str:
         img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode()
+        return buf.getvalue()
 
 
 def _clean_json(raw: str) -> str:
@@ -152,40 +161,6 @@ def _clean_json(raw: str) -> str:
         if raw.startswith("json"):
             raw = raw[4:]
     return raw.strip()
-
-
-def _build_payload(b64: str) -> dict:
-    if IS_LM_STUDIO:
-        return {
-            "model": settings.VLM_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                        },
-                    ],
-                }
-            ],
-            "stream": False,
-            "temperature": 0.1,
-            # LM Studio "options"/"repeat_penalty" tanimiyor; OpenAI-uyumlu
-            # alanlar bunlar. repeat_penalty karsiligi yok, elde degil.
-        }
-    else:
-        return {
-            "model": settings.VLM_MODEL,
-            "messages": [{"role": "user", "content": PROMPT, "images": [b64]}],
-            "stream": False,
-            "options": {
-                "num_ctx": NUM_CTX,
-                "temperature": 0.1,
-                "repeat_penalty": 1.05,  # dejenere tekrari (@@@@) frenler
-            },
-        }
 
 
 def _looks_degenerate(text: str, min_len: int = 150, max_ratio: float = 0.25) -> bool:
@@ -203,54 +178,155 @@ def _looks_degenerate(text: str, min_len: int = 150, max_ratio: float = 0.25) ->
     return ratio < max_ratio
 
 
-async def _call_vlm(client: httpx.AsyncClient, payload: dict) -> str:
-    r = await client.post(_chat_url(), json=payload)
-    if r.status_code != 200:
-        print("VLM HATASI:", r.status_code, r.text)
-    r.raise_for_status()
-
-    data = r.json()
-
-    if IS_LM_STUDIO:
-        choices = data.get("choices") or []
-        raw = (choices[0].get("message") or {}).get("content", "") if choices else ""
-        # SAGLIK KONTROLU: OpenAI-uyumlu ucta prompt_eval_count yok, onun
-        # yerine usage.completion_tokens'in dolu gelmesi bekleniyor.
-        usage = data.get("usage") or {}
-        if not usage.get("completion_tokens"):
-            raise ValueError(f"anormal vlm cevabi (usage.completion_tokens yok): {raw[:80]!r}")
-    else:
-        raw = (data.get("message") or {}).get("content", "")
-        # SAGLIK KONTROLU: prompt_eval_count yoksa uretim normal yolla olmadi
-        # (context tasmasinda dejenere ciktida bu alan gelmiyordu).
-        if data.get("prompt_eval_count") is None:
-            raise ValueError(f"anormal vlm cevabi (prompt_eval_count yok): {raw[:80]!r}")
-
-    # Dejenere tekrar dedektoru: cikti tek/iki karakterin tekrarindan olusuyorsa
+def _check_degenerate(raw: str) -> None:
+    """Her iki saglayici icin ORTAK dejenere-cikti kontrolu. Sorun varsa
+    ValueError firlatir (analyze_photo bunu yakalayip TEK bir temiz retry yapar)."""
     if len(set(raw.strip())) <= 2 and len(raw.strip()) > 20:
         raise ValueError(f"dejenere cikti (karakter tekrari): {raw[:40]!r}")
-
     if _looks_degenerate(raw):
         raise ValueError(f"dejenere cikti (cumle/kelime dongusu): {raw[:80]!r}")
+
+
+# ---------------------------------------------------------------------------
+# LM Studio (yerel, OpenAI-uyumlu HTTP)
+# ---------------------------------------------------------------------------
+
+
+def _build_payload_lm_studio(b64: str) -> dict:
+    return {
+        "model": settings.VLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        "stream": False,
+        "temperature": 0.1,
+        # Onceden hic yoktu - model dejenere/donen bir ciktiya girdiginde
+        # (bkz. _check_degenerate) sinirsiz token uretip suresiz uzayabiliyordu.
+        # JSON semasi (Bkz. PROMPT) tipik olarak ~200-400 token'a sigar; 700
+        # bolluca pay biraktigi halde kacak/donen uretimi erken kesiyor.
+        "max_tokens": 700,
+        # LM Studio "options"/"repeat_penalty" tanimiyor; OpenAI-uyumlu
+        # alanlar bunlar. repeat_penalty karsiligi yok, elde degil.
+    }
+
+
+async def _call_vlm_lm_studio(image_bytes: bytes) -> str:
+    payload = _build_payload_lm_studio(base64.b64encode(image_bytes).decode())
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(_chat_url(), json=payload)
+        if r.status_code != 200:
+            print("VLM HATASI:", r.status_code, r.text)
+        r.raise_for_status()
+        data = r.json()
+
+    choices = data.get("choices") or []
+    raw = (choices[0].get("message") or {}).get("content", "") if choices else ""
+    # SAGLIK KONTROLU: OpenAI-uyumlu ucta prompt_eval_count yok, onun
+    # yerine usage.completion_tokens'in dolu gelmesi bekleniyor.
+    usage = data.get("usage") or {}
+    if not usage.get("completion_tokens"):
+        raise ValueError(f"anormal vlm cevabi (usage.completion_tokens yok): {raw[:80]!r}")
+
+    _check_degenerate(raw)
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# AWS Bedrock
+# ---------------------------------------------------------------------------
+
+_bedrock_client = None
+
+
+def _get_bedrock_client():
+    """Tek ornek (singleton) - her cagrida yeni boto3 client'i acmamak icin."""
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=settings.AWS_REGION)
+    return _bedrock_client
+
+
+def _call_vlm_bedrock_sync(image_bytes: bytes) -> str:
+    """Bedrock'un birlesik Converse API'sini kullanir - model-basina ozel
+    istek govdesi gerektirmez, coklu Bedrock modeliyle (Claude, Nova, vb.)
+    ayni sekilde calisir.
+
+    BILINCLI OLARAK SENKRON (boto3'un async destegi yok, ayri bir
+    aioboto3 bagimliligi gerektirir). Bu, cagrilan yerde (asyncio olay
+    dongusunu) BLOKE EDER - ama photo_service._vlm_executor zaten VLM
+    icin AYRILMIS, tek isci thread'inde, kendi basina bir asyncio.run()
+    dongusu aciyor (bkz. Bolum 6.3.5, Mimari Rehberi); bu dongude VLM
+    cagrisiyla es zamanli baska hicbir is yok, yani bloke etmenin
+    baska hicbir isteği geciktirme riski yok.
+    """
+    client = _get_bedrock_client()
+    response = client.converse(
+        modelId=settings.AWS_BEDROCK_MODEL_ID,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"text": PROMPT},
+                    {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
+                ],
+            }
+        ],
+        # maxTokens: LM Studio yolundaki ayni gerekce (Bkz. _build_payload_lm_studio) -
+        # dejenere/donen ciktiyi erken kesen bir ust sinir.
+        inferenceConfig={"temperature": 0.1, "maxTokens": 700},
+    )
+
+    blocks = (response.get("output") or {}).get("message", {}).get("content", [])
+    raw = "".join(b.get("text", "") for b in blocks if "text" in b)
+
+    # SAGLIK KONTROLU: stopReason "end_turn" disinda bir seyse (ör.
+    # "max_tokens", "content_filtered") cikti eksik/guvensiz olabilir.
+    stop_reason = response.get("stopReason")
+    if not raw or stop_reason not in ("end_turn", "stop_sequence"):
+        raise ValueError(f"anormal vlm cevabi (stopReason={stop_reason!r}): {raw[:80]!r}")
 
     return raw
 
 
+async def _call_vlm_bedrock(image_bytes: bytes) -> str:
+    raw = _call_vlm_bedrock_sync(image_bytes)
+    _check_degenerate(raw)
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+
+async def _call_vlm(image_bytes: bytes) -> str:
+    if IS_LM_STUDIO:
+        return await _call_vlm_lm_studio(image_bytes)
+    return await _call_vlm_bedrock(image_bytes)
+
+
 async def analyze_photo(image_path: str) -> VLMResult:
-    b64 = _encode_image(image_path)
-    payload = _build_payload(b64)
+    image_bytes = _encode_image(image_path)
 
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            raw = await _call_vlm(client, payload)
+        raw = await _call_vlm(image_bytes)
         result = VLMResult.model_validate_json(_clean_json(raw))
         if _is_placeholder_echo(result):
             raise ValueError("VLM sablonu aynen geri dondurdu")
         return result
     except (ValidationError, ValueError):
         # Bozuk/şablon/dejenere içerikten sonra temiz bir retry
-        async with httpx.AsyncClient(timeout=45) as client:
-            raw2 = await _call_vlm(client, payload)
+        raw2 = await _call_vlm(image_bytes)
 
         result2 = VLMResult.model_validate_json(_clean_json(raw2))
         if _is_placeholder_echo(result2):

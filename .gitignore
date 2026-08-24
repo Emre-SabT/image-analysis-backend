@@ -1,12 +1,31 @@
+# Ortam degiskenleri ve sirlar
 .env
 .env.local
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
 venv/
 .venv/
+
+# Loglar
 *.log
+logs/
+
+# Calisma zamani verisi/ciktilari - KOD DEGIL, git'e girmemeli
+# (models/ ozellikle: ONNX agirliklari yuzlerce MB - repoyu sisirir)
 uploads/
 foto_sahne/
+models/
+reports/
+
+# Yerel gelistirme araclari
 .claude/
-scripts/
+
+# Hedeflenen tasarim dokumani - ayri, degistirilmeyen bir kaynak
 PhotoAI_Teknik_Tasarim_Dokumani.docx
+
+# NOT: scripts/ ARTIK burada degil - bilincli olarak kaldirildi.
+# 14 bakim/olcum aracinin tamami koddur, git'e girmesi gerekiyor
+# (bkz. Backend Mimari ve Kod Rehberi, Ek - "yuksek riskli acik").

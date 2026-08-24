@@ -9,8 +9,19 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.db.session import Base
-from app.db.models import Photo, PhotoAnalysis
-from app.config import settings
+from app.db.models import (
+    Job,
+    UserJobCounter,
+    User,
+    RefreshToken,
+    Photo,
+    PhotoAnalysis,
+    Cluster,
+    Person,
+    Face,
+    ClusterConstraint,
+)
+from app.core.settings import settings
 
 config = context.config
 
