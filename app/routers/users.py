@@ -3,7 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_role
+from app.core.dependencies import get_current_user, require_role
+from app.db.models import User
 from app.db.session import get_db
 from app.schemas import UserCreateRequest, UserResponse, UserUpdateRequest
 from app.services import auth_service
@@ -28,3 +29,17 @@ def update_user(user_id: uuid.UUID, payload: UserUpdateRequest, db: Session = De
     return auth_service.update_user(
         db, user_id, payload.display_name, payload.role, payload.is_active
     )
+
+
+@router.delete("/{user_id}", status_code=204)
+def delete_user(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """DELETE /users/{id} (BACKEND_IHTIYACLARI.md #8) - kalici silme.
+    "Devre disi birak" (`PATCH .../{"is_active": false}`) hala VAR ve
+    cogu senaryo icin TERCIH EDILEN yol (audit izi korunur) - bu, gercekten
+    kalici silme istendiginde kullanilan, EK korumali (kendi hesabini
+    silememe + is gecmisi varsa reddetme) ikinci bir uc."""
+    auth_service.delete_user(db, user_id, current_user.id)

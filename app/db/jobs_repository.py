@@ -439,6 +439,14 @@ def queue_status_by_type(
     face (~0,13 sn) ve vlm (~8-20 sn) sureleri buyuklukce farkli oldugundan
     KARISIK TEK ORTALAMA anlamsiz olurdu. Tahmini sure son N tamamlanmis
     isin OLCULEN ortalamasindan gelir - sabit bir tahmin degeri yok.
+
+    'queued' VE 'running' BIRLIKTE sayilir (yalnizca 'queued' DEGIL) -
+    onceki surumde yalnizca 'queued' sayiliyordu, bu yuzden bir is
+    ('running'e gectigi an - face ~0,13sn'de neredeyse ANINDA, vlm ise
+    8-20sn boyunca) FIILEN islenirken panel "bekleyen isiniz yok"
+    gosteriyordu (kullanici bildirimi - QueuePanel.tsx'in "Bekleyen
+    işiniz yok" bosluk durumuyla CELISIYORDU, cunku aktif olarak bir is
+    surmesine ragmen 0 gorunuyordu).
     """
     own = session is None
     db = session or SessionLocal()
@@ -449,7 +457,7 @@ def queue_status_by_type(
                     f"""
                     SELECT type, count(*) AS queued
                     FROM jobs
-                    WHERE user_id = :user_id AND status = '{JOB_STATUS_QUEUED}'
+                    WHERE user_id = :user_id AND status IN ('{JOB_STATUS_QUEUED}', '{JOB_STATUS_RUNNING}')
                     GROUP BY type
                     """
                 ),

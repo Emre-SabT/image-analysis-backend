@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, require_role
+from app.core.time import to_iso_utc
 from app.db import jobs_repository
 from app.db.models import (
     JOB_TYPE_FACE_PIPELINE,
@@ -18,19 +19,56 @@ from app.services import face_service, photo_service
 router = APIRouter(prefix="/photos", tags=["photos"])
 
 
-def _to_dict(photo, analysis, faces=None):
+def _user_ref(user: User | None) -> dict | None:
+    """{id, display_name} - `user` None ise (coklu kullanici gecisinden ONCE
+    yuklenmis eski fotograflar, bkz. Photo.uploaded_by_user_id yorumu) None
+    doner, sahte bir "Sistem" adi UYDURULMAZ."""
+    if not user:
+        return None
+    return {"id": str(user.id), "display_name": user.display_name}
+
+
+def _exif_to_dict(exif) -> dict | None:
+    """BACKEND_IHTIYACLARI.md #6 - `exif` yoksa (henuz okunmadi/dosyada hic
+    EXIF olmadigi icin tum alanlari None) `None` doner, bos bir obje DEGIL -
+    frontend'in "Teknik" sekmesi bunu ayirt eder."""
+    if not exif:
+        return None
+    return {
+        "camera_make": exif.camera_make,
+        "camera_model": exif.camera_model,
+        "lens_model": exif.lens_model,
+        "aperture": exif.aperture,
+        "shutter_speed": exif.shutter_speed,
+        "iso": exif.iso,
+        "focal_length": exif.focal_length,
+        # BILEREK to_iso_utc() KULLANILMIYOR: EXIF DateTimeOriginal, kameranin
+        # KENDI yerel saatidir (zaman dilimi bilgisi EXIF'te YOK) - server
+        # UTC'siyle AYNI konvansiyon degil. UTC etiketi eklemek, kamera
+        # kullaniciyla FARKLI saat diliminde oldugunda YENI bir hataya yol
+        # acardi (bkz. app/core/time.py, "captured_at" istisnasi).
+        "captured_at": exif.captured_at.isoformat() if exif.captured_at else None,
+        "gps_latitude": exif.gps_latitude,
+        "gps_longitude": exif.gps_longitude,
+        "copyright": exif.copyright,
+        "width_px": exif.width_px,
+        "height_px": exif.height_px,
+        "file_size_bytes": exif.file_size_bytes,
+    }
+
+
+def _to_dict(photo, analysis, faces=None, uploaded_by: User | None = None, exif=None):
     data = {
         "photo_id": str(photo.id),
         "filename": photo.filename,
         "status": photo.status,
-        "created_at": photo.created_at.isoformat() if photo.created_at else None,
+        "created_at": to_iso_utc(photo.created_at),
+        "uploaded_by": _user_ref(uploaded_by),
+        "exif": _exif_to_dict(exif),
     }
     if analysis:
         data.update({
             "description": analysis.description,
-            "environment_type": analysis.environment_type,
-            "people_count": analysis.people_count,
-            "possible_event": analysis.possible_event,
             "primary_object": analysis.primary_object,
             "secondary_objects": analysis.secondary_objects,
             "environment": analysis.environment,
@@ -44,6 +82,11 @@ def _to_dict(photo, analysis, faces=None):
             "public_figures": analysis.public_figures,
             "all_tags": analysis.all_tags,
             "model_name": analysis.model_name,
+            # BACKEND_IHTIYACLARI.md #5: tek GERCEK zaman damgali olay
+            # (yukleme haric) - icerik analizinin NE ZAMAN bittigi. `None`
+            # olabilir (analiz henuz bitmemis/basarisiz) - frontend'in
+            # "Islem gecmisi" sekmesi bunu KOSULLU gosterir, uydurmaz.
+            "analyzed_at": to_iso_utc(analysis.analyzed_at),
         })
     data["faces"] = [
         {
@@ -52,6 +95,11 @@ def _to_dict(photo, analysis, faces=None):
             "person_id": str(f.person_id) if f.person_id else None,
             "assigned_by": f.assigned_by,
             "is_background": f.is_background,
+            # BACKEND_IHTIYACLARI.md #4 (BE-4): tespit kutusu koordinatlari
+            # artik API'de doner - DB'de zaten vardi (Face.bbox), yalnizca
+            # yaniti KISITLAYAN bu satir eksikti. {x, y, w, h}, piksel
+            # cinsinden, orijinal foto boyutuna gore (bkz. face_service).
+            "bbox": f.bbox,
         }
         for f in (faces or [])
     ]
@@ -88,7 +136,16 @@ def upload_photo(
         db.commit()
         _, analysis = photo_service.get_photo_with_analysis(db, photo.id)
         faces = face_service.get_faces_for_photo(db, photo.id)
-        data = _to_dict(photo, analysis, faces)
+        # Mevcut (ilk) fotografin YUKLEYICISI - `current_user` DEGIL: ayni
+        # icerigi baska biri daha once yuklemis olabilir, gercek sahiplik
+        # UYDURULMAZ.
+        original_uploader = (
+            db.query(User).filter(User.id == photo.uploaded_by_user_id).first()
+            if photo.uploaded_by_user_id
+            else None
+        )
+        exif = photo_service.get_exif(db, photo.id)
+        data = _to_dict(photo, analysis, faces, uploaded_by=original_uploader, exif=exif)
         data["duplicate"] = True
         return data
 
@@ -112,6 +169,7 @@ def upload_photo(
         "filename": photo.filename,
         "status": photo.status,
         "duplicate": False,
+        "uploaded_by": _user_ref(current_user),
         "face_job_id": str(face_job_id),
         "vlm_job_id": str(vlm_job_id),
     }
@@ -159,19 +217,30 @@ def photo_status(photo_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.get("", dependencies=[Depends(get_current_user)])
 def list_photos(db: Session = Depends(get_db)):
+    pairs = photo_service.list_photos(db)
+    # N+1 onlemek icin TUM yukleyicileri VE EXIF kayitlarini tek sorguda cek
+    # (BACKEND_IHTIYACLARI.md - "kim yukledi" ve "#6 EXIF" artik GET /photos
+    # yanitinda gerceklesiyor).
+    user_ids = {p.uploaded_by_user_id for p, _ in pairs if p.uploaded_by_user_id}
+    users_by_id = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+    exif_by_photo_id = photo_service.get_exif_map(db, [p.id for p, _ in pairs])
     return [
-        _to_dict(p, a, face_service.get_faces_for_photo(db, p.id))
-        for p, a in photo_service.list_photos(db)
+        _to_dict(
+            p, a, face_service.get_faces_for_photo(db, p.id),
+            uploaded_by=users_by_id.get(p.uploaded_by_user_id),
+            exif=exif_by_photo_id.get(p.id),
+        )
+        for p, a in pairs
     ]
 
 
 @router.delete("/{photo_id}", dependencies=[Depends(require_role("admin", "editor"))])
-def delete_photo(photo_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete_photo(photo_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """DELETE /photos/{id} - fotografi ve ondan turemis tum veriyi siler.
     Fotograftaki yuzler de klasorlerinden cikarilir; etkilenen kisi/klasorlerin
     merkezleri kalan uyelerle yeniden hesaplanir."""
     try:
-        return photo_service.delete_photo(db, photo_id)
+        return photo_service.delete_photo(db, photo_id, current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

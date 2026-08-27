@@ -14,8 +14,10 @@ from qdrant_client.models import PointStruct
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.time import to_iso_utc
 from app.db import identity_locks, qdrant
-from app.db.models import Cluster, ClusterConstraint, Face, Person, Photo
+from app.db.models import Cluster, ClusterConstraint, Face, Person, Photo, User
+from app.services import activity_log_service
 
 logger = logging.getLogger("photoai.person_service")
 
@@ -184,7 +186,7 @@ def list_clusters(db: Session, status: str = "unlabeled", sample_size: int = 5) 
                 "cluster_id": str(cluster.id),
                 "status": cluster.status,
                 "size": cluster.size,
-                "created_at": cluster.created_at.isoformat() if cluster.created_at else None,
+                "created_at": to_iso_utc(cluster.created_at),
                 "sample_faces": [
                     {
                         "face_id": str(f.id),
@@ -199,6 +201,16 @@ def list_clusters(db: Session, status: str = "unlabeled", sample_size: int = 5) 
     return result
 
 
+def _user_ref(user: User | None) -> dict | None:
+    """Kucuk, tekrar eden bir yardimci - {id, display_name} seklinde aktor
+    referansi. `user` None ise (coklu kullanici gecisinden ONCE olusmus
+    kayitlar - bkz. models.py Photo.uploaded_by_user_id yorumu) None doner,
+    sahte bir "Sistem" adi UYDURULMAZ."""
+    if not user:
+        return None
+    return {"id": str(user.id), "display_name": user.display_name}
+
+
 def list_persons(db: Session) -> list[dict]:
     """GET /persons - isimlendirilmis (aktif) tum kisiler, birer ornek yuzle ("klasor kapagi")."""
     persons = (
@@ -207,6 +219,9 @@ def list_persons(db: Session) -> list[dict]:
         .order_by(Person.created_at.desc())
         .all()
     )
+    user_ids = {p.created_by_user_id for p in persons if p.created_by_user_id}
+    users_by_id = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+
     result = []
     for person in persons:
         sample = db.query(Face).filter(Face.person_id == person.id).first()
@@ -215,7 +230,8 @@ def list_persons(db: Session) -> list[dict]:
                 "person_id": str(person.id),
                 "display_name": person.display_name,
                 "face_count": person.face_count,
-                "created_at": person.created_at.isoformat() if person.created_at else None,
+                "created_by": _user_ref(users_by_id.get(person.created_by_user_id)),
+                "created_at": to_iso_utc(person.created_at),
                 "sample_face": (
                     {"face_id": str(sample.id), "photo_id": str(sample.photo_id)}
                     if sample
@@ -224,6 +240,64 @@ def list_persons(db: Session) -> list[dict]:
             }
         )
     return result
+
+
+def get_merge_history(db: Session, limit: int = 50) -> list[dict]:
+    """GET /identities/merge-history - HDBSCAN'in urettigi birlestirme
+    ONERILERINDEN hangilerinin kabul (`merge_accept`) ya da red
+    (`merge_reject`) edildigini, KIM ve NE ZAMAN yaptigiyla birlikte dondurur
+    (bkz. BACKEND_IHTIYACLARI.md). BILINCLI OLARAK `face_detach` (kimlikten
+    ayirma) kayitlarini VE bu `source` kolonu eklenmeden once yazilmis eski
+    (source IS NULL) kayitlari DISLAR - ikisi de bir "oneri karari" degil,
+    ilkinde farkli bir eylem, ikincisinde kaynagi gercekten bilinmiyor
+    (UYDURULMAZ)."""
+    constraints = (
+        db.query(ClusterConstraint)
+        .filter(ClusterConstraint.source.in_(["merge_accept", "merge_reject"]))
+        .order_by(ClusterConstraint.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    if not constraints:
+        return []
+
+    user_ids = {c.created_by_user_id for c in constraints if c.created_by_user_id}
+    users_by_id = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+
+    face_ids = {c.face_id_a for c in constraints} | {c.face_id_b for c in constraints}
+    faces_by_id = {f.id: f for f in db.query(Face).filter(Face.id.in_(face_ids)).all()}
+
+    person_ids = {f.person_id for f in faces_by_id.values() if f.person_id}
+    persons_by_id = {p.id: p for p in db.query(Person).filter(Person.id.in_(person_ids)).all()} if person_ids else {}
+
+    def _identity_ref(face_id: uuid.UUID) -> dict:
+        face = faces_by_id.get(face_id)
+        if not face:
+            # Yuz o zamandan beri silinmis (ör. fotograf silindi) - kaydin
+            # KENDISI hala gecerli bir karar, sadece gorsel referans yok.
+            return {"face_id": str(face_id), "photo_id": None, "person_id": None, "display_name": None}
+        person = persons_by_id.get(face.person_id) if face.person_id else None
+        return {
+            "face_id": str(face.id),
+            "photo_id": str(face.photo_id),
+            "person_id": str(face.person_id) if face.person_id else None,
+            # Kisi o zamandan beri yeniden adlandirilmis/tasinmis olabilir -
+            # bu GUNCEL adi gosterir, karar anindaki adi DEGIL (backend o
+            # anki adi ayrica saklamiyor).
+            "display_name": person.display_name if person else None,
+        }
+
+    return [
+        {
+            "id": str(c.id),
+            "decision": "accepted" if c.source == "merge_accept" else "rejected",
+            "created_at": to_iso_utc(c.created_at),
+            "created_by": _user_ref(users_by_id.get(c.created_by_user_id)),
+            "face_a": _identity_ref(c.face_id_a),
+            "face_b": _identity_ref(c.face_id_b),
+        }
+        for c in constraints
+    ]
 
 
 def get_photos_for_person(db: Session, person_id: uuid.UUID):
@@ -280,6 +354,7 @@ def label_cluster(db: Session, cluster_id: uuid.UUID, display_name: str, created
     # yeni yuzleri yanlislikla bu artik-gecersiz kumeye yonlendirebilir.
     qdrant.client.delete(collection_name=qdrant.IDENTITY_POOL_COLLECTION, points_selector=[str(cluster.id)])
 
+    activity_log_service.log(db, created_by_user_id, "person_named", "person", person.id, display_name)
     db.commit()
     db.refresh(person)
 
@@ -301,10 +376,43 @@ def label_cluster(db: Session, cluster_id: uuid.UUID, display_name: str, created
     return person
 
 
+def rename_person(db: Session, person_id: uuid.UUID, display_name: str, actor_user_id: uuid.UUID | None = None) -> Person:
+    """PATCH /persons/{id} (BE-3) - zaten ISIMLENDIRILMIS bir kisinin adini
+    gunceller. `label_cluster`'in aksine ne kume/uyelik durumu ne Qdrant
+    identity_pool payload'i degisir (`display_name` orada TUTULMUYOR,
+    yalnizca PG'de) - bu yuzden kilit/dual-write GEREKMEZ, duz bir
+    okuma-guncelle-commit yeterli."""
+    person = db.query(Person).filter(Person.id == person_id, Person.deleted_at.is_(None)).first()
+    if person is None:
+        raise ValueError("Kisi bulunamadi")
+
+    old_name = person.display_name
+    person.display_name = display_name
+    db.add(person)
+    activity_log_service.log(
+        db, actor_user_id, "person_renamed", "person", person_id, display_name,
+        extra={"old_name": old_name},
+    )
+    db.commit()
+    db.refresh(person)
+    return person
+
+
 def _faces_of_identity(db: Session, kind: str, identity_id: uuid.UUID) -> list[Face]:
     if kind == "person":
         return db.query(Face).filter(Face.person_id == identity_id).all()
     return db.query(Face).filter(Face.cluster_id == identity_id).all()
+
+
+def _identity_label(db: Session, kind: str, identity_id: uuid.UUID) -> str:
+    """ActivityLog target_label icin - kisiyse GERCEK adi, kumeyse (henuz
+    isimlendirilmemis) "İsimsiz kimlik" (bkz. frontend'deki AYNI etiket,
+    ör. MergeSuggestionCard) - sahte bir isim UYDURULMAZ."""
+    if kind == "person":
+        person = db.query(Person).filter(Person.id == identity_id).first()
+        if person:
+            return person.display_name
+    return "İsimsiz kimlik"
 
 
 def _is_merge_blocked(
@@ -369,14 +477,25 @@ def reject_merge(db: Session, identities: list[dict], created_by_user_id: uuid.U
                     face_id_b=reps[j][2].id,
                     type="cannot_link",
                     created_by_user_id=created_by_user_id,
+                    source="merge_reject",
                 )
             )
             added += 1
+
+    # Tum feedin OKUNAKLI olmasi icin TEK bir ozet satiri (her cift icin
+    # ayri ayri DEGIL) - etiketler burada COZULUR, cunku ClusterConstraint
+    # yalnizca yuz id'si tasir, kimlik adini degil.
+    labels = [_identity_label(db, kind, ident) for kind, ident, _face in reps]
+    activity_log_service.log(
+        db, created_by_user_id, "identity_reject_merge", "identity_group", None,
+        " + ".join(labels),
+        extra={"identities": [{"kind": kind, "id": str(ident)} for kind, ident, _face in reps]},
+    )
     db.commit()
     return {"constraints_added": added}
 
 
-def delete_identity(db: Session, kind: str, identity_id: uuid.UUID) -> dict:
+def delete_identity(db: Session, kind: str, identity_id: uuid.UUID, actor_user_id: uuid.UUID | None = None) -> dict:
     """Bir klasoru (kisi ya da isimsiz kume) ve icindeki TUM yuz kayitlarini
     kalici olarak siler.
 
@@ -402,6 +521,7 @@ def delete_identity(db: Session, kind: str, identity_id: uuid.UUID) -> dict:
         identity = db.query(Cluster).filter(Cluster.id == identity_id).first()
     if identity is None:
         raise ValueError("Klasor bulunamadi")
+    deleted_label = identity.display_name if kind == "person" else "İsimsiz kimlik"
 
     faces = _faces_of_identity(db, kind, identity_id)
     face_ids = [f.id for f in faces]
@@ -462,6 +582,10 @@ def delete_identity(db: Session, kind: str, identity_id: uuid.UUID) -> dict:
     pool_ids = [str(identity_id)] + ([str(linked_cluster_id)] if linked_cluster_id else [])
     qdrant.client.delete(collection_name=qdrant.IDENTITY_POOL_COLLECTION, points_selector=pool_ids)
 
+    activity_log_service.log(
+        db, actor_user_id, "identity_delete", kind, identity_id, deleted_label,
+        extra={"deleted_faces": len(face_ids)},
+    )
     db.commit()
 
     return {"deleted_kind": kind, "deleted_id": str(identity_id), "deleted_faces": len(face_ids)}
@@ -519,6 +643,7 @@ def merge_identities(
             face_id_b=source_faces[0].id,
             type="must_link",
             created_by_user_id=created_by_user_id,
+            source="merge_accept",
         )
     )
 
@@ -559,6 +684,16 @@ def merge_identities(
     # AKTIF bir identity_pool kaydi kalir; _assign_or_bucket yeni yuzleri
     # sessizce bu "silinmis" kisiye atayabilir.
     qdrant.client.delete(collection_name=qdrant.IDENTITY_POOL_COLLECTION, points_selector=[str(source_id)])
+
+    # `_identity_label` person icin deleted_at'e BAKMADAN sorgular (yukarida
+    # source soft-delete edildi ama satir hala DB'de) - display_name hala
+    # okunabilir.
+    target_label = _identity_label(db, target_kind, target_id)
+    source_label = _identity_label(db, source_kind, source_id)
+    activity_log_service.log(
+        db, created_by_user_id, "identity_merge", target_kind, target_id, target_label,
+        extra={"source_kind": source_kind, "source_id": str(source_id), "source_label": source_label},
+    )
 
     db.commit()
 
@@ -652,6 +787,7 @@ def reassign_face(
                 face_id_b=remaining.id,
                 type="cannot_link",
                 created_by_user_id=created_by_user_id,
+                source="face_detach",
             )
         )
 
@@ -668,6 +804,17 @@ def reassign_face(
         face.cluster_id = new_cluster_id
     face.assigned_by = "human"
     db.flush()
+
+    if person_id is not None:
+        activity_log_service.log(
+            db, created_by_user_id, "face_reassign", "person", person_id, target.display_name,
+            extra={"face_id": str(face.id), "photo_id": str(face.photo_id)},
+        )
+    else:
+        activity_log_service.log(
+            db, created_by_user_id, "face_reassign", "face", face.id, None,
+            extra={"photo_id": str(face.photo_id), "detached": True},
+        )
 
     # Yeni kimligin face_count'u (SADECE mevcut bir kisiye tasiniyorsa - yeni
     # kume dalinda zaten Cluster(size=1,...) ile dogru doguyor) - Katman 1'in

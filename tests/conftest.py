@@ -122,5 +122,12 @@ def test_user_id(db_session):
     db_session.execute(
         text("DELETE FROM user_job_counters WHERE user_id = :u"), {"u": str(uid)}
     )
+    # activity_log.actor_user_id SET NULL'dir (kullanici silinince PATLAMAZ) -
+    # ama bu, testlerin urettigi satirlarin SESSIZCE "Bilinmeyen kullanici"
+    # olarak GERCEK Son Etkinlik akisinda kalici kalmasi demek (bkz. Genel
+    # Bakis'ta gorulen test kirliligi - "Test", "Ahmet", "P1"...). Testler
+    # GERCEK DB'ye yazdigi icin (bkz. dosya basi yorumu - yalnizca `jobs`
+    # sahte/TEMP) kendi urettikleri gunluk satirlarini da silmeli.
+    db_session.execute(text("DELETE FROM activity_log WHERE actor_user_id = :u"), {"u": str(uid)})
     db_session.execute(text("DELETE FROM users WHERE id = :u"), {"u": str(uid)})
     db_session.commit()

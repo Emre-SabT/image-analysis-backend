@@ -60,16 +60,39 @@ class Photo(Base):
     uploaded_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class PhotoExif(Base):
+    """BACKEND_IHTIYACLARI.md #6 - dosyadan GERCEKTEN okunan EXIF/teknik
+    meta veri. Yukleme sirasinda BIR KEZ, senkron doldurulur
+    (photo_service.save_upload -> _extract_exif) - VLM/yuz hatti gibi ayri
+    bir arka plan isi GEREKMEZ, Pillow'un EXIF okumasi cok ucuzdur.
+    Okunamayan/dosyada hic olmayan alanlar NULL kalir, UYDURULMAZ."""
+    __tablename__ = "photo_exif"
+    photo_id = Column(UUID(as_uuid=True), ForeignKey("photos.id", ondelete="CASCADE"), primary_key=True)
+    camera_make = Column(String, nullable=True)
+    camera_model = Column(String, nullable=True)
+    lens_model = Column(String, nullable=True)
+    aperture = Column(String, nullable=True)  # "f/2.8"
+    shutter_speed = Column(String, nullable=True)  # "1/250 sn"
+    iso = Column(Integer, nullable=True)
+    focal_length = Column(String, nullable=True)  # "50mm"
+    # GERCEK cekim tarihi (EXIF DateTimeOriginal) - Photo.created_at
+    # (YUKLEME zamani) ile KARISTIRILMAZ, ikisi FARKLI olaylar.
+    captured_at = Column(DateTime, nullable=True)
+    gps_latitude = Column(Float, nullable=True)
+    gps_longitude = Column(Float, nullable=True)
+    copyright = Column(String, nullable=True)
+    width_px = Column(Integer, nullable=True)
+    height_px = Column(Integer, nullable=True)
+    file_size_bytes = Column(BigInteger, nullable=True)
+
+
 class PhotoAnalysis(Base):
     __tablename__ = "photo_analysis"
     photo_id = Column(UUID(as_uuid=True), ForeignKey("photos.id"), primary_key=True)
     description = Column(Text)
-    environment_type = Column(String)  # indoor | outdoor | mixed
-    people_count = Column(Integer)
-    possible_event = Column(String)
     primary_object = Column(String)
     secondary_objects = Column(ARRAY(String), server_default=text("'{}'"))
-    environment = Column(ARRAY(String), server_default=text("'{}'"))  # mekan/ortam etiketleri (eski environment_type ile karistirma)
+    environment = Column(ARRAY(String), server_default=text("'{}'"))  # mekan/ortam etiketleri
     attributes = Column(ARRAY(String), server_default=text("'{}'"))
     action = Column(String)
     mood = Column(String)
@@ -146,6 +169,79 @@ class ClusterConstraint(Base):
     type = Column(String, nullable=False)  # must_link | cannot_link
     created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # HANGI eylemden geldigini ayirt eder - `type` tek basina yetmiyor:
+    # "cannot_link" hem bir birlestirme ONERISININ REDDinden (reject_merge)
+    # HEM DE alakasiz bir "kimlikten ayir" (reassign_face split) eyleminden
+    # yazilabiliyor. GET /identities/merge-history bu ikisini KARISTIRMAMAK
+    # icin source'a gore filtreler (bkz. BACKEND_IHTIYACLARI.md).
+    # merge_accept | merge_reject | face_detach | NULL (bu kolon eklenmeden
+    # ONCE yazilmis eski kayitlar - kaynagi GERCEKTEN bilinmiyor, UYDURULMAZ).
+    source = Column(String, nullable=True)
+
+
+# --- Etkinlik/audit gunlugu (BACKEND_IHTIYACLARI.md #5 + kullanici istegi) --
+#
+# Kurumsal ORTAK havuz: bir albumde/kimlikte/fotografta yapilan HER islemden
+# (silme, birlestirme, albume ekleme/cikarma, yeniden adlandirma, yuz
+# atama...) TUM kullanicilarin haberi olmali. Bu tablo, ilgili servis
+# fonksiyonu her mutasyon yaptiginda AYNI transaction icinde (commit'ten
+# ONCE) bir satir yazar - bkz. app/services/activity_log_service.py.
+
+class ActivityLog(Base):
+    __tablename__ = "activity_log"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # SET NULL (photos.uploaded_by_user_id/persons.created_by_user_id ile AYNI
+    # ilke, bkz. migration b1c4d6e8f0a2) - bir kullanici kalici silinse bile
+    # gecmis islem kaydi KAYBOLMAZ, yalnizca aktoru bilinmez hale gelir.
+    actor_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # photo_upload | photo_delete | album_create | album_delete |
+    # album_photo_add | album_photo_remove | person_named | person_renamed |
+    # identity_merge | identity_reject_merge | identity_delete | face_reassign
+    action = Column(String, nullable=False)
+    target_kind = Column(String, nullable=False)  # photo | album | person | cluster | face
+    # FK DEGIL (bilincli): hedef sonradan silinebilir, o zaman bile GECMIS
+    # kaydin kendisi anlamli kalmali (bkz. target_label).
+    target_id = Column(UUID(as_uuid=True), nullable=True)
+    # Insan-okunabilir etiket KARAR ANINDA donduruldu (ör. dosya adi, album
+    # adi, kisi adi) - hedef sonradan silinse/yeniden adlandirilsa bile
+    # GECMISTEKI olay anlamli kalir, "bilinmeyen ID" gorunmez.
+    target_label = Column(String, nullable=True)
+    # Ek baglam (ör. {"added": 5, "album_name": "..."}) - opsiyonel, aksiyon
+    # turune gore degisir. Python tarafinda `extra` (SQLAlchemy'de `metadata`
+    # Base'in kendi ozniteligiyle CAKISIR).
+    extra = Column("metadata", JSONB, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# --- Albumler (BACKEND_IHTIYACLARI.md #1) ---
+#
+# Bir fotograf BIRDEN FAZLA albumde olabilir - bu yuzden `Photo.album_id`
+# DEGIL, ayri bir join tablosu (`AlbumPhoto`). Album silinince fotograflar
+# SILINMEZ (yalnizca album_photos kayitlari CASCADE ile gider) - kisi/kume
+# silmedeki "fotograflara dokunmaz" ilkesiyle AYNI (bkz. person_service.
+# delete_identity).
+
+class Album(Base):
+    __tablename__ = "albums"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Liste/kart görünümünde thumbnail için - kullanıcı seçer (varsayılan:
+    # albüme eklenen İLK fotoğraf, bkz. album_service). Fotoğraf silinirse
+    # SET NULL (migration) - albüm kapaksız kalır, hiçbir şey patlamaz.
+    cover_photo_id = Column(UUID(as_uuid=True), ForeignKey("photos.id"), nullable=True)
+
+
+class AlbumPhoto(Base):
+    __tablename__ = "album_photos"
+    album_id = Column(UUID(as_uuid=True), ForeignKey("albums.id", ondelete="CASCADE"), primary_key=True)
+    photo_id = Column(UUID(as_uuid=True), ForeignKey("photos.id", ondelete="CASCADE"), primary_key=True)
+    added_at = Column(DateTime, default=datetime.utcnow)
+    added_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
 
 # --- Is kuyrugu (PostgreSQL tabanli, FOR UPDATE SKIP LOCKED) ---
 #

@@ -9,13 +9,14 @@ from fastapi import UploadFile
 from qdrant_client.models import PointStruct
 from sqlalchemy.orm import Session
 from PIL import Image, ImageOps
+from PIL.ExifTags import GPSTAGS, TAGS
 import pillow_heif
 
 from app.db import identity_locks, locks, qdrant
-from app.db.models import ClusterConstraint, Face, Photo, PhotoAnalysis
+from app.db.models import ClusterConstraint, Face, Photo, PhotoAnalysis, PhotoExif
+from app.ai import dispatcher
 from app.ai.dispatcher import analyze_photo
-from app.services import face_service, person_service
-from app.core.settings import settings
+from app.services import activity_log_service, face_service, person_service
 
 logger = logging.getLogger("photoai.photo_service")
 
@@ -80,11 +81,144 @@ def save_upload(db: Session, file: UploadFile, uploaded_by_user_id: uuid.UUID | 
         uploaded_by_user_id=uploaded_by_user_id,
     )
     db.add(photo)
+    activity_log_service.log(db, uploaded_by_user_id, "photo_upload", "photo", photo_id, file.filename)
+
+    # BACKEND_IHTIYACLARI.md #6: EXIF senkron, tek seferlik okunur (VLM/yuz
+    # hatti gibi ayri bir arka plan isi GEREKMEZ - Pillow'un EXIF okumasi
+    # cok ucuz, ms mertebesinde). Okuma BASARISIZ olursa (bozuk/desteklenmeyen
+    # dosya) yukleme YINE DE devam eder - EXIF ikincil bir zenginlestirme,
+    # yuklemeyi ENGELLEMEMELI (bkz. _extract_exif icindeki genis except).
+    exif_fields = _extract_exif(str(storage_path))
+    db.add(PhotoExif(photo_id=photo_id, file_size_bytes=len(content), **exif_fields))
+
     # COMMIT DEGIL FLUSH: commit sorumlulugu CAGIRANA (router) ait.
     # POST /photos, foto satirini ve IKI job satirini TEK atomik commit'te
     # yazmali - job insert patlarsa foto insert de geri alinmali.
     db.flush()
     return photo, False
+
+
+def _clean_exif_str(value) -> str | None:
+    """EXIF string alanlari bazen sonuna NUL/bosluk dolgusu ekler ("Canon\\x00\\x00")
+    ya da tamamen bos gelir - ikisi de None'a normalize edilir (bos string
+    frontend'de "var ama bos" gibi yanlis anlasilirdi)."""
+    if value is None:
+        return None
+    cleaned = str(value).strip().strip("\x00").strip()
+    return cleaned or None
+
+
+def _dms_to_decimal(dms, ref) -> float | None:
+    """EXIF GPS koordinatlari (derece, dakika, saniye) + yon referansi
+    ("N"/"S"/"E"/"W") -> ondalik derece. Herhangi bir parca eksik/bozuksa
+    None (UYDURULMAZ)."""
+    if not dms or not ref:
+        return None
+    try:
+        degrees, minutes, seconds = (float(x) for x in dms)
+        decimal = degrees + minutes / 60 + seconds / 3600
+        return -decimal if ref in ("S", "W") else decimal
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_exif(image_path: str) -> dict:
+    """Dosyadan GERCEKTEN okunabilen EXIF alanlarini cikarir - okunamayan/
+    dosyada hic olmayan her alan None kalir, hicbir sey UYDURULMAZ (bkz.
+    BACKEND_IHTIYACLARI.md #6). `file_size_bytes` burada YOK (cagiran zaten
+    diske yazilan bayt sayisini biliyor, dosyayi ikinci kez stat() etmeye
+    gerek yok).
+
+    HEIC dahil TUM formatlar icin AYNI yol - `pillow_heif.register_heif_opener()`
+    (modul yuklenirken bir kez cagriliyor) `Image.open()`'in HEIC dosyalarda
+    da standart EXIF APP1 segmentini okumasini saglar, ayri bir dal GEREKMEZ.
+    """
+    result: dict = {
+        "camera_make": None, "camera_model": None, "lens_model": None,
+        "aperture": None, "shutter_speed": None, "iso": None,
+        "focal_length": None, "captured_at": None,
+        "gps_latitude": None, "gps_longitude": None, "copyright": None,
+        "width_px": None, "height_px": None,
+    }
+    try:
+        with Image.open(image_path) as img:
+            result["width_px"], result["height_px"] = img.size
+
+            exif = img.getexif()
+            if not exif:
+                return result
+            tags = {TAGS.get(k, k): v for k, v in exif.items()}
+
+            result["camera_make"] = _clean_exif_str(tags.get("Make"))
+            result["camera_model"] = _clean_exif_str(tags.get("Model"))
+            result["copyright"] = _clean_exif_str(tags.get("Copyright"))
+
+            date_str = tags.get("DateTime")
+            if date_str:
+                try:
+                    result["captured_at"] = datetime.strptime(str(date_str), "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    pass
+
+            # Pozlama/lens bilgisi (FNumber, ExposureTime, ISO, LensModel,
+            # FocalLength, DateTimeOriginal) ana IFD'de DEGIL, ayri bir
+            # "Exif IFD" alt-blogunda (tag 0x8769) tutulur.
+            exif_ifd = {}
+            try:
+                exif_ifd = {TAGS.get(k, k): v for k, v in exif.get_ifd(0x8769).items()}
+            except (AttributeError, KeyError):
+                pass
+
+            dto = exif_ifd.get("DateTimeOriginal")
+            if dto:
+                try:
+                    result["captured_at"] = datetime.strptime(str(dto), "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    pass
+
+            f_number = exif_ifd.get("FNumber")
+            if f_number:
+                try:
+                    result["aperture"] = f"f/{float(f_number):g}"
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+            exposure = exif_ifd.get("ExposureTime")
+            if exposure:
+                try:
+                    seconds = float(exposure)
+                    result["shutter_speed"] = f"{seconds:g} sn" if seconds >= 1 else f"1/{round(1 / seconds)} sn"
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+            iso = exif_ifd.get("ISOSpeedRatings") or exif_ifd.get("PhotographicSensitivity")
+            if iso is not None:
+                try:
+                    result["iso"] = int(iso[0] if isinstance(iso, (list, tuple)) else iso)
+                except (TypeError, ValueError, IndexError):
+                    pass
+
+            focal = exif_ifd.get("FocalLength")
+            if focal:
+                try:
+                    result["focal_length"] = f"{float(focal):g}mm"
+                except (TypeError, ValueError):
+                    pass
+
+            result["lens_model"] = _clean_exif_str(exif_ifd.get("LensModel"))
+
+            # GPS bilgisi de kendi alt-blogunda (tag 0x8825).
+            try:
+                gps_ifd = {GPSTAGS.get(k, k): v for k, v in exif.get_ifd(0x8825).items()}
+                result["gps_latitude"] = _dms_to_decimal(gps_ifd.get("GPSLatitude"), gps_ifd.get("GPSLatitudeRef"))
+                result["gps_longitude"] = _dms_to_decimal(gps_ifd.get("GPSLongitude"), gps_ifd.get("GPSLongitudeRef"))
+            except (AttributeError, KeyError):
+                pass
+    except Exception as e:
+        # EXIF okuma BASARISIZ olsa da yukleme akisi durmamali - ikincil bir
+        # zenginlestirme (bkz. cagiran yerdeki yorum).
+        logger.warning(f"EXIF okunamadi ({image_path}): {type(e).__name__}: {e}")
+    return result
 
 
 
@@ -123,9 +257,6 @@ async def run_vlm_analysis(db: Session, photo: Photo) -> Photo:
         analysis = PhotoAnalysis(
             photo_id=photo.id,
             description=result.description,
-            environment_type=result.environment_type,
-            people_count=result.people_count,
-            possible_event=result.possible_event,
             primary_object=result.primary_object,
             secondary_objects=result.secondary_objects,
             environment=result.environment,
@@ -138,7 +269,7 @@ async def run_vlm_analysis(db: Session, photo: Photo) -> Photo:
             audience=result.audience,
             public_figures=[pf.model_dump() for pf in result.public_figures],
             all_tags=result.all_tags,
-            model_name=settings.VLM_MODEL,
+            model_name=dispatcher.CURRENT_MODEL_NAME,
             analyzed_at=datetime.utcnow(),
         )
         db.add(analysis)
@@ -160,6 +291,19 @@ def get_photo_with_analysis(db: Session, photo_id: uuid.UUID):
     return photo, analysis
 
 
+def get_exif(db: Session, photo_id: uuid.UUID) -> PhotoExif | None:
+    return db.query(PhotoExif).filter(PhotoExif.photo_id == photo_id).first()
+
+
+def get_exif_map(db: Session, photo_ids: list[uuid.UUID]) -> dict[uuid.UUID, PhotoExif]:
+    """N+1 onlemek icin TOPLU cekim - `_to_dict`'e `uploaded_by` icin
+    kullanilan AYNI desen (bkz. routers/photos.py: list_photos)."""
+    if not photo_ids:
+        return {}
+    rows = db.query(PhotoExif).filter(PhotoExif.photo_id.in_(photo_ids)).all()
+    return {r.photo_id: r for r in rows}
+
+
 def list_photos(db: Session):
     photos = db.query(Photo).order_by(Photo.created_at.desc()).all()
     out = []
@@ -169,7 +313,7 @@ def list_photos(db: Session):
     return out
 
 
-def delete_photo(db: Session, photo_id: uuid.UUID) -> dict:
+def delete_photo(db: Session, photo_id: uuid.UUID, actor_user_id: uuid.UUID | None = None) -> dict:
     """Bir fotografi ve ondan turemis TUM veriyi siler.
 
     Silinenler: fotograf dosyasi (+ HEIC onbellegi), photo_analysis kaydi,
@@ -184,6 +328,10 @@ def delete_photo(db: Session, photo_id: uuid.UUID) -> dict:
     photo = db.query(Photo).filter(Photo.id == photo_id).first()
     if photo is None:
         raise ValueError("Fotograf bulunamadi")
+    # Silinmeden ONCE - ActivityLog'un target_label'i BUNA ihtiyac duyar
+    # (bkz. asagidaki log() cagrisi, bulk .delete() sonrasi da erisilebilir
+    # olsa da acik olsun diye ayri bir degiskene alindi).
+    deleted_filename = photo.filename
 
     faces = db.query(Face).filter(Face.photo_id == photo_id).all()
     face_ids = [f.id for f in faces]
@@ -247,6 +395,9 @@ def delete_photo(db: Session, photo_id: uuid.UUID) -> dict:
                 pass
 
     db.query(Photo).filter(Photo.id == photo_id).delete(synchronize_session=False)
+    activity_log_service.log(
+        db, actor_user_id, "photo_delete", "photo", photo_id, deleted_filename
+    )
     db.commit()
 
     # PR-D, KATMAN 2: uyesi kalan (silinmeyen) her kisi/kume icin KENDI

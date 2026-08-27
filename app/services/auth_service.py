@@ -17,7 +17,7 @@ from app.core.security import (
     verify_password,
 )
 from app.core.settings import settings
-from app.db.models import RefreshToken, User
+from app.db.models import Job, RefreshToken, User
 from app.schemas import TokenResponse
 
 
@@ -124,3 +124,39 @@ def update_user(db: Session, user_id: uuid.UUID, display_name: str | None, role:
     db.commit()
     db.refresh(user)
     return user
+
+
+def delete_user(db: Session, user_id: uuid.UUID, current_user_id: uuid.UUID) -> None:
+    """DELETE /users/{id} (BACKEND_IHTIYACLARI.md #8) - kullaniciyi KALICI
+    olarak siler. `update_user`'daki `is_active: false` (devre disi
+    birakma) ile KARISTIRILMASIN - o gercek ve halen tercih edilen yol;
+    bu, ayrica istenen GERCEK silme.
+
+    Iki koruma, ikisi de backend'de (NFR-S3 ile ayni ilke - yalniz
+    frontend'e guvenilmez):
+      1. Admin kendi hesabini SILEMEZ (yanlislikla kendi erisimini
+         kaybetmesin, bkz. EditUserDialog.tsx'teki AYNI ilke).
+      2. Kullanicinin `jobs` gecmisi VARSA silme REDDEDILIR - `jobs.user_id`
+         BILINCLI OLARAK NOT NULL/RESTRICT birakildi (bkz. migration
+         b1c4d6e8f0a2 basindaki not): is kuyrugu adil siralamasi (
+         sequence_in_user) kullaniciya bagli, sessizce NULL'a cekilip audit
+         izi kaybolmaz. Pratikte: hic fotograf yuklememis (jobs'i olmayan)
+         kullanicilar silinebilir, gercek is gecmisi olanlar icin
+         "devre disi birak" tek secenek kalir.
+    """
+    if user_id == current_user_id:
+        raise ConflictError("Kendi hesabinizi silemezsiniz")
+
+    user = db.get(User, user_id)
+    if user is None:
+        raise NotFoundError("Kullanici bulunamadi")
+
+    has_jobs = db.query(Job.id).filter(Job.user_id == user_id).first() is not None
+    if has_jobs:
+        raise ConflictError(
+            "Bu kullanicinin is gecmisi (yukleme/analiz kaydi) var, kalici olarak silinemez - "
+            "once devre disi birakin"
+        )
+
+    db.delete(user)
+    db.commit()

@@ -238,7 +238,7 @@ def test_delete_photo_pg_matches_qdrant_for_remaining_person(test_user_id, clean
         cleanup_registry["faces"].append(f2.id)
 
         person_id, photo1_id = person.id, photo1.id
-        photo_service.delete_photo(db, photo1_id)
+        photo_service.delete_photo(db, photo1_id, test_user_id)
     finally:
         db.close()
 

@@ -12,7 +12,7 @@ from app.core.settings import settings
 from app.db.qdrant import ensure_collections
 from app.db import qdrant
 from app.db.session import SessionLocal
-from app.routers import auth, faces, jobs, photos, users
+from app.routers import albums, auth, faces, jobs, photos, system, users
 
 logger = logging.getLogger("photoai")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -39,6 +39,8 @@ app.include_router(users.router)
 app.include_router(jobs.router)
 app.include_router(photos.router)
 app.include_router(faces.router)
+app.include_router(system.router)
+app.include_router(albums.router)
 
 # ServiceError (auth/kullanici hatalari - 401/403/404/409) -> tutarli JSON
 # govdesi. Genel Exception handler'dan ONCE kaydedilir; Starlette daha
@@ -91,11 +93,36 @@ def _check_qdrant() -> dict:
 
 
 def _check_vlm() -> dict:
+    """AI_PROVIDER'a gore DOGRU yolu kontrol eder - dispatcher.py'nin
+    IS_LM_STUDIO dallanmasiyla AYNI mantik. ONCEDEN AI_PROVIDER'dan BAGIMSIZ
+    her zaman VLM_BASE_URL'e (LM Studio) bakiyordu - AI_PROVIDER=bedrock iken
+    bu YANLIS sinyal veriyordu (LM Studio calisan biri varsa "ok" gorunurdu,
+    asil kullanilan Bedrock hattinin durumuyla hicbir ilgisi olmadan)."""
+    if settings.AI_PROVIDER == "lm_studio":
+        try:
+            base = settings.VLM_BASE_URL.rstrip("/")
+            url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+            resp = httpx.get(url, timeout=3)
+            resp.raise_for_status()
+            return {"status": "ok"}
+        except Exception as e:
+            return {"status": "error", "detail": str(e)}
+
+    # bedrock: gercek modeli CAGIRMAZ (ucretli + yavas, her /health isteginde
+    # yapilamaz) - yalnizca AWS kimlik bilgilerinin GECERLI ve ERISILEBILIR
+    # oldugunu dogrular (STS herhangi bir IAM principal icin izinli, ekstra
+    # bedrock:* izni GEREKMEZ). Bu, "Bedrock'a InvokeModel yapabiliyor muyuz"
+    # sorusunun TAM cevabi degil - "AWS'ye gecerli kimlikle baglanabiliyor
+    # muyuz" sorusunun cevabidir; ama VLM_BASE_URL'e bakmaktan cok daha
+    # dogru bir sinyal (o, bu saglayiciyla ALAKASIZ).
     try:
-        base = settings.VLM_BASE_URL.rstrip("/")
-        url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
-        resp = httpx.get(url, timeout=3)
-        resp.raise_for_status()
+        import boto3
+        from botocore.config import Config
+
+        sts = boto3.client(
+            "sts", region_name=settings.AWS_REGION, config=Config(connect_timeout=3, read_timeout=3)
+        )
+        sts.get_caller_identity()
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}

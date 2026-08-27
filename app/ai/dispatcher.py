@@ -1,12 +1,10 @@
 import base64
 import io
-import re
 import zlib
 
 import boto3
 import httpx
 from pydantic import BaseModel, ValidationError, field_validator
-from typing import Literal
 from app.core.settings import settings
 from PIL import Image, ImageOps
 import pillow_heif
@@ -26,6 +24,12 @@ MAX_DIMENSION = 768
 # eklendi - kullanicinin acik istegiyle.
 IS_LM_STUDIO = settings.AI_PROVIDER == "lm_studio"
 
+# `PhotoAnalysis.model_name`'e yazilan deger BURADAN gelmeli, dogrudan
+# `settings.VLM_MODEL`'den DEGIL - o alan yalnizca LM Studio icin anlamli,
+# Bedrock kullanilirken YANLIS bir isim (LM Studio'nun model adi) gosterirdi
+# (bkz. photo_service.py:run_vlm_analysis - onceki hata).
+CURRENT_MODEL_NAME = settings.VLM_MODEL if IS_LM_STUDIO else settings.AWS_BEDROCK_MODEL_ID
+
 
 def _chat_url() -> str:
     """Sadece LM Studio icin - Bedrock HTTP degil, boto3 uzerinden cagrilir."""
@@ -42,9 +46,8 @@ Kurallar:
 - Sadece fotoğrafta açıkça görülen veya güçlü şekilde çıkarılabilen bilgileri yaz; tahmine dayalı uydurma detay ekleme.
 - Gereksiz tekrar yapma, çok genel/boş etiketler ("fotoğraf", "görsel" gibi) kullanma.
 - description 1-2 cümle olsun.
-- primary_object, action, mood, use_case, possible_event tek string olmalı.
+- primary_object, action, mood, use_case tek string olmalı.
 - secondary_objects, environment, attributes, context, style, audience array olmalı; bilgi yoksa boş dizi döndür.
-- people_count HER ZAMAN bir tam sayı olmalı (örnek: 0, 3, 15, 40). Kalabalık veya net sayılamıyorsa yaklaşık bir tam sayı tahmin et (örn. 50). Asla "çok", "birçok", "hundreds" gibi bir kelime yazma.
 - public_figures sadece tanınmış veya kamusal açıdan önemli kişiler için doldurulmalı (sıradan/özel kişiler için değil). Bir kişiden emin değilsen name alanını boş string ("") yap, types alanını yine de doldurabilirsin. Aynı kişi tekrar etmemeli.
 - all_tags, description ve public_figures.name HARİÇ tüm alanların birleşiminden oluşmalı: primary_object, secondary_objects, environment, attributes, action, mood, use_case, context, style, audience, public_figures.types. Duplicate etiket kullanma, all_tags içine açıklama cümlesi ekleme.
 - Fotoğrafta ürün üzerinde okunabilir bir marka/metin varsa (ör. ambalaj, etiket, kutu üzerindeki yazı), açıklamanı o yazıya dayandır; yazıyla çelişen bir varsayımda bulunma (ör. kutunun üzerinde "kahve" yazıyorsa "bira" deme).
@@ -52,9 +55,6 @@ Kurallar:
 JSON şeması:
 {
   "description": "kısa açıklama (1-2 cümle)",
-  "environment_type": "indoor" veya "outdoor" veya "mixed",
-  "people_count": sayı,
-  "possible_event": "olası etkinlik türü",
   "primary_object": "ana nesne veya odak",
   "secondary_objects": ["ikincil nesneler"],
   "environment": ["ortam/mekan etiketleri"],
@@ -89,9 +89,6 @@ class PublicFigure(BaseModel):
 
 class VLMResult(BaseModel):
     description: str
-    environment_type: Literal["indoor", "outdoor", "mixed"]
-    people_count: int
-    possible_event: str
     primary_object: str
     secondary_objects: list[str] = []
     environment: list[str] = []
@@ -105,22 +102,11 @@ class VLMResult(BaseModel):
     public_figures: list[PublicFigure] = []
     all_tags: list[str] = []
 
-    @field_validator("people_count", mode="before")
-    @classmethod
-    def _coerce_people_count(cls, v):
-        # Model bazen "500-600" gibi bir aralik yaziyor; ortalamasini al.
-        if isinstance(v, str):
-            nums = [int(n) for n in re.findall(r"\d+", v)]
-            if nums:
-                return round(sum(nums) / len(nums))
-        return v
-
 
 # JSON semasindaki aciklayici placeholder metinler -- model bunlari aynen
 # geri dondurursek "sablonu papagan gibi tekrarladi" olarak isaretleriz.
 _PLACEHOLDERS = {
     "kısa açıklama (1-2 cümle)",
-    "olası etkinlik türü",
     "ana nesne veya odak",
     "yapılan aktivite",
     "atmosfer / ruh hali",
@@ -132,7 +118,6 @@ def _is_placeholder_echo(result: VLMResult) -> bool:
     """Model, prompt'taki örnek metni olduğu gibi geri döndürdüyse tespit eder."""
     fields = [
         result.description,
-        result.possible_event,
         result.primary_object,
         result.action,
         result.mood,

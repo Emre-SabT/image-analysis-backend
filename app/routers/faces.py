@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, require_role
+from app.core.time import to_iso_utc
 from app.db.models import User
 from app.db.session import get_db
 from app.routers.photos import _to_dict as _photo_to_dict
@@ -11,6 +12,7 @@ from app.schemas import (
     ClusterLabelRequest,
     FaceReassignRequest,
     IdentityMergeRequest,
+    PersonRenameRequest,
     RejectMergeRequest,
 )
 from app.services import clustering_service, face_service, person_service, photo_service
@@ -28,7 +30,7 @@ def _person_to_dict(person) -> dict:
         "cluster_id": str(person.cluster_id) if person.cluster_id else None,
         "face_count": person.face_count,
         "created_by_user_id": str(person.created_by_user_id) if person.created_by_user_id else None,
-        "created_at": person.created_at.isoformat() if person.created_at else None,
+        "created_at": to_iso_utc(person.created_at),
     }
 
 
@@ -56,6 +58,14 @@ def get_merge_suggestions(db: Session = Depends(get_db)):
     return clustering_service.suggest_merges(db)
 
 
+@router.get("/identities/merge-history")
+def get_merge_history(db: Session = Depends(get_db)):
+    """GET /identities/merge-history - birlestirme onerilerinden hangilerinin
+    kabul/red edildigini, kim ve ne zaman yaptigiyla birlikte dondurur
+    (bkz. BACKEND_IHTIYACLARI.md, person_service.get_merge_history)."""
+    return person_service.get_merge_history(db)
+
+
 @router.post("/clusters/{cluster_id}/label", dependencies=[Depends(require_role("admin", "editor"))])
 def label_cluster(
     cluster_id: uuid.UUID,
@@ -75,6 +85,24 @@ def label_cluster(
 def get_persons(db: Session = Depends(get_db)):
     """GET /persons - isimlendirilmis tum kisiler ("klasorler"), birer ornek yuzle."""
     return person_service.list_persons(db)
+
+
+@router.patch("/persons/{person_id}", dependencies=[Depends(require_role("admin", "editor"))])
+def rename_person(
+    person_id: uuid.UUID,
+    body: PersonRenameRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """PATCH /persons/{id} - mevcut bir kisinin adini gunceller (BE-3,
+    bkz. BACKEND_IHTIYACLARI.md #3). `POST /clusters/{id}/label`'dan
+    FARKLI: o isimSIZ bir kumeyi Person'a donusturur, bu zaten ISIMLI
+    bir Person kaydinin display_name'ini gunceller."""
+    try:
+        person = person_service.rename_person(db, person_id, body.display_name, current_user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return _person_to_dict(person)
 
 
 @router.get("/persons/{person_id}/photos")
@@ -123,12 +151,17 @@ def reject_merge(
 
 
 @router.delete("/identities/{kind}/{identity_id}", dependencies=[Depends(require_role("admin", "editor"))])
-def delete_identity(kind: str, identity_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete_identity(
+    kind: str,
+    identity_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """DELETE /identities/{kind}/{id} - bir klasoru ve icindeki tum yuz
     kayitlarini kalici olarak siler (yanlis tespit temizligi + FR-13/KVKK).
     Fotograflara dokunmaz."""
     try:
-        return person_service.delete_identity(db, kind, identity_id)
+        return person_service.delete_identity(db, kind, identity_id, current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
