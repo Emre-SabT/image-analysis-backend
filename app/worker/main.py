@@ -27,6 +27,7 @@ import uuid
 from app.core.settings import settings
 from app.db.models import (
     JOB_TYPE_FACE_PIPELINE,
+    JOB_TYPE_SEMANTIC_INDEX,
     JOB_TYPE_VLM_ANALYSIS,
     KNOWN_JOB_TYPES,
 )
@@ -41,6 +42,7 @@ logger = logging.getLogger("photoai.worker")
 HANDLERS = {
     JOB_TYPE_FACE_PIPELINE: photo_service.run_face_pipeline_job,
     JOB_TYPE_VLM_ANALYSIS: photo_service.run_vlm_analysis_job,
+    JOB_TYPE_SEMANTIC_INDEX: photo_service.run_semantic_index_job,
 }
 
 
@@ -128,8 +130,10 @@ class Worker:
     def __init__(self, job_types: list[str], worker_id: str | None = None):
         self.job_types = job_types
         self.worker_id = worker_id or f"{os.uname().nodename if hasattr(os, 'uname') else os.environ.get('COMPUTERNAME', 'host')}-{os.getpid()}"
+        self._job_types_csv = ",".join(job_types)
         self._shutdown = threading.Event()
         self._last_reap = 0.0
+        self._last_heartbeat = 0.0
 
     def request_shutdown(self, *_):
         """SIGTERM/SIGINT: mevcut isi BITIR, YENI is ALMA."""
@@ -147,6 +151,24 @@ class Worker:
                 logger.info("reap_stale: %d is kuyruga geri konuldu", reaped)
         except Exception:
             logger.exception("reap_stale hatasi")
+        try:
+            # Olu worker (restart -> yeni worker_id) satirlarini temizle.
+            # Esik STALE'den cok daha buyuk (gecici takilma 'olu' sayilmasin).
+            jobs.prune_stale_heartbeats(settings.JOB_STALE_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception("prune_stale_heartbeats hatasi")
+
+    def _maybe_heartbeat(self, *, force: bool = False):
+        """Worker SURECININ canliligini worker_heartbeats'e yazar (bostayken
+        de). Isin kilit heartbeat'inden (jobs.heartbeat) AYRI kavram."""
+        now = time.monotonic()
+        if not force and now - self._last_heartbeat < settings.WORKER_HEARTBEAT_INTERVAL_SECONDS:
+            return
+        self._last_heartbeat = now
+        try:
+            jobs.record_heartbeat(self.worker_id, self._job_types_csv)
+        except Exception:
+            logger.exception("record_heartbeat hatasi")
 
     def _process(self, job: jobs.ClaimedJob) -> None:
         handler = HANDLERS.get(job.type)
@@ -227,7 +249,9 @@ class Worker:
     def run(self) -> None:
         logger.info("Worker basladi: id=%s tipler=%s",
                     self.worker_id, ",".join(self.job_types))
+        self._maybe_heartbeat(force=True)  # baslar baslamaz gorunur ol
         while not self._shutdown.is_set():
+            self._maybe_heartbeat()
             self._maybe_reap()
             try:
                 job = jobs.claim_next(self.worker_id, self.job_types)
@@ -244,7 +268,14 @@ class Worker:
             logger.info("Is alindi: job=%s type=%s deneme=%d/%d",
                         job.id, job.type, job.attempts, job.max_attempts)
             self._process(job)
+            self._maybe_heartbeat()  # uzun bir isten sonra gecikmeden tazele
 
+        # Graceful shutdown: kaydi sil ki "stale" gorunmesin (best-effort -
+        # SIGKILL/crash'te calismaz, o durumu STALE esigi + prune yakalar).
+        try:
+            jobs.clear_heartbeat(self.worker_id)
+        except Exception:
+            logger.exception("clear_heartbeat hatasi")
         logger.info("Worker temiz sekilde durdu: id=%s", self.worker_id)
 
 

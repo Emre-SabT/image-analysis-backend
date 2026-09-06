@@ -1,7 +1,10 @@
 import asyncio
 import hashlib
+import json
 import logging
+import os
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -12,21 +15,63 @@ from PIL import Image, ImageOps
 from PIL.ExifTags import GPSTAGS, TAGS
 import pillow_heif
 
-from app.db import identity_locks, locks, qdrant
-from app.db.models import ClusterConstraint, Face, Photo, PhotoAnalysis, PhotoExif
+from app.core.settings import settings
+from app.db import identity_locks, jobs_repository, locks, qdrant
+from app.db.models import (
+    JOB_TYPE_SEMANTIC_INDEX,
+    ClusterConstraint,
+    Face,
+    Photo,
+    PhotoAnalysis,
+    PhotoExif,
+)
 from app.ai import dispatcher
 from app.ai.dispatcher import analyze_photo
-from app.services import activity_log_service, face_service, person_service
+from app.services import activity_log_service, face_service, person_service, semantic_service
 
 logger = logging.getLogger("photoai.photo_service")
 
 pillow_heif.register_heif_opener()
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+# Depolama koku. PHOTOAI_UPLOAD_ROOT env degiskeni ile yonlendirilebilir -
+# testler ve yan-yana calisan ikinci bir ornek, uretim uploads/ dizinini
+# (ve onu izleyen canli ingestion dongusunu) kirletmesin diye. Verilmezse
+# proje kokundeki "uploads".
+UPLOAD_DIR = Path(os.environ.get("PHOTOAI_UPLOAD_ROOT", "uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 CONVERTED_DIR = UPLOAD_DIR / "converted"
 CONVERTED_DIR.mkdir(exist_ok=True)
+
+# --- Depolama yerlesimi (inbox -> stored) -------------------------------
+#
+#   uploads/
+#   ├── inbox/      POST /photos'un yazdigi, HENUZ DB'ye alinmamis dosyalar
+#   ├── stored/     ingestion tamamlanmis, kalici fotograflar
+#   ├── failed/     kalici olarak islenemeyen dosyalar (elle inceleme icin)
+#   ├── converted/  MEVCUT - HEIC->JPG onizleme turevleri (dokunulmadi)
+#   └── {uuid}.ext  MEVCUT 483 fotograf - OLDUKLARI YERDE BIRAKILDI
+#
+# ESKI FOTOGRAFLAR TASINMADI (bilincli): her tuketici yolu Photo.storage_path
+# uzerinden DB'den okuyor (face_service, dispatcher, system router, silme) -
+# sabit kodlu dizin YOK. Dolayisiyla eski kayitlar "uploads/{uuid}.ext",
+# yeniler "uploads/stored/{uuid}.ext" gosterir ve ikisi de calisir. Toplu
+# dosya tasima + 483 satirlik UPDATE, hicbir sey kazandirmayan bir risktir.
+INBOX_DIR = UPLOAD_DIR / "inbox"
+STORED_DIR = UPLOAD_DIR / "stored"
+FAILED_DIR = UPLOAD_DIR / "failed"
+for _d in (INBOX_DIR, STORED_DIR, FAILED_DIR):
+    _d.mkdir(exist_ok=True)
+
+# Yaziliyor olan dosyanin uzantisi. Ingestion taramasi bu uzantiyi ATLAR -
+# yarim dosyanin islenmesi boylece YAPISAL OLARAK imkansiz olur.
+PART_SUFFIX = ".part"
+# Yukleyen kullanici/orijinal dosya adi gibi, dosyanin KENDISINDE olmayan
+# bilgiyi tasiyan yan dosya. Ingestion ayri bir surecte/thread'de calistigi
+# icin HTTP istegindeki baglami baska turlu goremez.
+META_SUFFIX = ".meta.json"
+# Diski RAM'e almadan okumak icin parca boyutu (bkz. save_upload).
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 
@@ -39,63 +84,165 @@ class LockConflict(Exception):
     _process()'teki ayri except bloğu)."""
 
 
-def save_upload(db: Session, file: UploadFile, uploaded_by_user_id: uuid.UUID | None = None) -> tuple[Photo, bool]:
-    """Dosyanin SHA-256 hash'ini hesaplar, diske YAZMADAN ONCE ayni icerigin
-    (bayt bayt) daha once yuklenip yuklenmedigini kontrol eder.
+@dataclass(frozen=True)
+class ReceivedUpload:
+    """receive_upload'in sonucu.
 
-    Dosya tekillestirme: aynı fotoğraf birden fazla yüklenirse yüz/analiz
-    kayıtları da tekrarlanıyordu (dosya adı degil, ICERIK karsilastirilir -
-    ayni foto farkli isimle tekrar yuklense bile yakalanir). Eslesme varsa
-    hicbir yeni dosya/DB kaydi olusturulmadan MEVCUT Photo dondurulur.
-
-    Yaris durumu notu: content_hash kolonu DB'de UNIQUE degil (bkz. models.py -
-    bu ozellik eklenmeden once yuklenmis, halihazirda yinelenen fotograflar
-    yuzunden), bu yuzden tam es zamanli iki ayni-dosya yuklemesi teorik olarak
-    ikisi de gecebilir. Bu uygulama tek kullanicili/yerel oldugundan ve
-    yuklemeler frontend'de sirali (await) yapildigindan pratikte bir risk
-    tasimiyor.
-
-    Donus: (photo, is_duplicate)
+    `duplicate=True` ise `existing` DOLU ve inbox'a HICBIR SEY birakilmamistir
+    (gecici .part silinir) - is kaydi da olusmaz. `duplicate=False` ise dosya
+    inbox'ta TAMAMLANMIS halde bekler; DB kaydini ve is kayitlarini ingestion
+    dongusu olusturur (bkz. app/services/ingestion_service.py).
     """
-    content = file.file.read()
-    content_hash = hashlib.sha256(content).hexdigest()
+    photo_id: uuid.UUID
+    filename: str
+    content_hash: str
+    duplicate: bool
+    existing: Photo | None = None
 
-    existing = db.query(Photo).filter(Photo.content_hash == content_hash).first()
-    if existing:
-        return existing, True
 
+def receive_upload(
+    db: Session, file: UploadFile, uploaded_by_user_id: uuid.UUID | None = None
+) -> ReceivedUpload:
+    """Yuklenen dosyayi inbox'a yazar. DB'ye HICBIR SEY YAZMAZ, is OLUSTURMAZ.
+
+    ESKI DAVRANIS (save_upload) ile fark: eskiden bu fonksiyon Photo/EXIF
+    satirlarini da olusturuyordu ve dosyanin TAMAMINI `file.file.read()` ile
+    RAM'e aliyordu. Ikisi de degisti:
+
+    1. AKIS HALINDE YAZIM: dosya 1 MB'lik parcalar halinde dogrudan diske
+       yazilir ve SHA-256 ayni gecliste hesaplanir - ikinci bir okuma YOK,
+       bellekte tam kopya YOK. 12 es zamanli 20 MB'lik yukleme eskiden ~240 MB
+       anlik RAM demekti; simdi ~12 MB.
+
+    2. ATOMIK GORUNURLUK: once "{photo_id}{ext}.part" adiyla yazilir, dosya
+       TAMAMEN yazildiktan ve yan-dosya (meta) olustuktan SONRA os.replace ile
+       nihai adina cevrilir. Ingestion taramasi .part uzantisini hic gormez -
+       yarim dosyanin islenmesi YAPISAL OLARAK imkansizdir.
+
+    YAN-DOSYA (.meta.json) NEDEN VAR: ingestion ayri bir dongude calisir ve
+    HTTP istegindeki baglami (yukleyen kullanici, orijinal dosya adi)
+    goremez; bu bilgi dosyanin kendisinde de yoktur. Meta, nihai yeniden
+    adlandirmadan ONCE yazilir - boylece ingestion tamamlanmis bir goruntu
+    dosyasini META'SIZ gorebilecegi bir an OLUSMAZ. Ayrica meta'nin VARLIGI
+    "bu dosyanin ingestion'i henuz bitmedi" isaretidir (bkz. ingestion_service
+    icindeki crash kurtarma).
+
+    DUPLICATE: hash zaten akis sirasinda hesaplandigi icin ek maliyeti
+    OLMADAN burada kontrol edilir - kullanicinin "Zaten arsivde" yanitini
+    ANINDA almasi bu sayede korunur. Bu bir ON ELEME'dir; ASIL tekillik
+    garantisi DB'deki UNIQUE(content_hash) kisitidir (bkz. models.py) -
+    tam es zamanli iki ayni-dosya yuklemesinde ikisi de bu kontrolu gecebilir,
+    o durumda ingestion tarafinda UNIQUE ihlali yakalanir.
+    """
     ext = Path(file.filename).suffix.lower()
     photo_id = uuid.uuid4()
-    stored_name = f"{photo_id}{ext}"
-    storage_path = UPLOAD_DIR / stored_name
+    part_path = INBOX_DIR / f"{photo_id}{ext}{PART_SUFFIX}"
+    final_path = INBOX_DIR / f"{photo_id}{ext}"
 
-    with open(storage_path, "wb") as out:
-        out.write(content)
+    digest = hashlib.sha256()
+    total_bytes = 0
+    try:
+        file.file.seek(0)
+        with open(part_path, "wb") as out:
+            while chunk := file.file.read(UPLOAD_CHUNK_BYTES):
+                digest.update(chunk)
+                total_bytes += len(chunk)
+                out.write(chunk)
+        content_hash = digest.hexdigest()
 
+        existing = db.query(Photo).filter(Photo.content_hash == content_hash).first()
+        if existing is not None:
+            # Yeni bir sey uretilmez: .part silinir, inbox'a hicbir sey
+            # birakilmaz, is kuyruga alinmaz (eski davranisla ayni).
+            part_path.unlink(missing_ok=True)
+            logger.info("[UPLOAD] duplicate: %s (hash=%s)", file.filename, content_hash[:12])
+            return ReceivedUpload(
+                photo_id=existing.id, filename=file.filename,
+                content_hash=content_hash, duplicate=True, existing=existing,
+            )
+
+        _write_inbox_meta(
+            final_path,
+            {
+                "photo_id": str(photo_id),
+                "original_filename": file.filename,
+                "content_hash": content_hash,
+                "size_bytes": total_bytes,
+                "uploaded_by_user_id": str(uploaded_by_user_id) if uploaded_by_user_id else None,
+                "received_at": datetime.utcnow().isoformat(),
+            },
+        )
+        # ATOMIK: bu satirdan ONCE ingestion dosyayi goremez, SONRA tam
+        # halini gorur. Ayni dosya sisteminde os.replace atomiktir.
+        os.replace(part_path, final_path)
+    except BaseException:
+        # Yarim kalan .part'i birakma - aksi halde inbox'ta STALE_PART
+        # suresince oksuz dosya bekler.
+        part_path.unlink(missing_ok=True)
+        _meta_path_for(final_path).unlink(missing_ok=True)
+        raise
+
+    logger.info(
+        "[UPLOAD] inbox'a alindi: %s -> %s (%d bayt, hash=%s)",
+        file.filename, final_path.name, total_bytes, content_hash[:12],
+    )
+    return ReceivedUpload(
+        photo_id=photo_id, filename=file.filename,
+        content_hash=content_hash, duplicate=False,
+    )
+
+
+def _meta_path_for(image_path: Path) -> Path:
+    return image_path.with_name(image_path.name + META_SUFFIX)
+
+
+def _write_inbox_meta(image_path: Path, meta: dict) -> None:
+    """Yan-dosyayi KENDISI de atomik yazar: once .part, sonra rename.
+    Yarim bir JSON, ingestion tarafinda ayristirma hatasi demekti."""
+    meta_path = _meta_path_for(image_path)
+    tmp = meta_path.with_name(meta_path.name + PART_SUFFIX)
+    tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, meta_path)
+
+
+def read_inbox_meta(image_path: Path) -> dict | None:
+    """Yan-dosyayi okur. Yoksa/bozuksa None - cagiran bunu 'oksuz dosya'
+    olarak ele alir (bkz. ingestion_service.ingest_file)."""
+    meta_path = _meta_path_for(image_path)
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def build_photo_row(
+    photo_id: uuid.UUID,
+    filename: str,
+    storage_path: Path,
+    content_hash: str,
+    uploaded_by_user_id: uuid.UUID | None,
+    size_bytes: int,
+    exif_source_path: Path,
+) -> tuple[Photo, PhotoExif]:
+    """Photo + PhotoExif nesnelerini uretir (session'a EKLEMEZ, commit ETMEZ).
+
+    EXIF okumasi burada kalir: BACKEND_IHTIYACLARI.md #6 geregi tek seferlik
+    ve senkron (Pillow'un okumasi ms mertebesinde, ayri bir arka plan isi
+    GEREKTIRMEZ). Okuma basarisiz olursa alanlar None kalir ve ingestion YINE
+    DE devam eder - EXIF ikincil bir zenginlestirme, fotografin sisteme
+    alinmasini ENGELLEMEMELI (bkz. _extract_exif icindeki genis except).
+    """
     photo = Photo(
         id=photo_id,
-        filename=file.filename,
+        filename=filename,
         storage_path=str(storage_path),
         status="processing",
         content_hash=content_hash,
         uploaded_by_user_id=uploaded_by_user_id,
     )
-    db.add(photo)
-    activity_log_service.log(db, uploaded_by_user_id, "photo_upload", "photo", photo_id, file.filename)
-
-    # BACKEND_IHTIYACLARI.md #6: EXIF senkron, tek seferlik okunur (VLM/yuz
-    # hatti gibi ayri bir arka plan isi GEREKMEZ - Pillow'un EXIF okumasi
-    # cok ucuz, ms mertebesinde). Okuma BASARISIZ olursa (bozuk/desteklenmeyen
-    # dosya) yukleme YINE DE devam eder - EXIF ikincil bir zenginlestirme,
-    # yuklemeyi ENGELLEMEMELI (bkz. _extract_exif icindeki genis except).
-    exif_fields = _extract_exif(str(storage_path))
-    db.add(PhotoExif(photo_id=photo_id, file_size_bytes=len(content), **exif_fields))
-
-    # COMMIT DEGIL FLUSH: commit sorumlulugu CAGIRANA (router) ait.
-    # POST /photos, foto satirini ve IKI job satirini TEK atomik commit'te
-    # yazmali - job insert patlarsa foto insert de geri alinmali.
-    db.flush()
-    return photo, False
+    exif_fields = _extract_exif(str(exif_source_path))
+    exif = PhotoExif(photo_id=photo_id, file_size_bytes=size_bytes, **exif_fields)
+    return photo, exif
 
 
 def _clean_exif_str(value) -> str | None:
@@ -280,6 +427,23 @@ async def run_vlm_analysis(db: Session, photo: Photo) -> Photo:
 
     db.commit()
     db.refresh(photo)
+
+    # Analiz basariliysa semantik indeksleme isini kuyruga al - AYRI, ucuncu
+    # bir hat (JOB_TYPE_SEMANTIC_INDEX). Bilincli olarak analiz commit'inden
+    # SONRA ve AYRI bir commit'te: enqueue patlarsa analiz sonucu KAYBOLMAZ
+    # (kısmi başarı ilkesi). Yukleyicisi bilinmeyen eski fotograflar sabit
+    # sistem servis hesabina yazilir (settings.SYSTEM_USER_ID - is_active=False).
+    if photo.status == "analyzed" and settings.SEMANTIC_SEARCH_ENABLED:
+        try:
+            user_id = photo.uploaded_by_user_id or uuid.UUID(settings.SYSTEM_USER_ID)
+            jobs_repository.enqueue(
+                db, JOB_TYPE_SEMANTIC_INDEX, {"photo_id": str(photo.id)}, user_id
+            )
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"[SEMANTIC ENQUEUE HATASI] {photo.filename}: {type(e).__name__}: {e}")
+
     return photo
 
 
@@ -386,6 +550,21 @@ def delete_photo(db: Session, photo_id: uuid.UUID, actor_user_id: uuid.UUID | No
     db.query(PhotoAnalysis).filter(PhotoAnalysis.photo_id == photo_id).delete(
         synchronize_session=False
     )
+
+    # Semantik arama indeksi: Qdrant 'photo_semantic' noktasi + photo_embeddings
+    # satiri. photo_embeddings FK'si zaten CASCADE ama Qdrant noktasi CASCADE
+    # ile GITMEZ - acikca silinmeli. Qdrant erisilemezse (ya da ozellik sonradan
+    # kapatildiysa koleksiyon yoksa) fotograf silme akisi DURMAMALI - kirpim
+    # dosyasi unlink hatasiyla ayni ilke ("DB temizligi yine de surmeli").
+    if settings.SEMANTIC_SEARCH_ENABLED:
+        try:
+            semantic_service.remove_from_index(db, photo_id)
+        except Exception as e:
+            logger.warning(
+                "photo_id=%s semantik indeksten silinemedi (%s: %s) - fotograf "
+                "silme akisi suruyor, Qdrant'ta sahipsiz nokta kalabilir.",
+                photo_id, type(e).__name__, e,
+            )
 
     for path in (Path(photo.storage_path), CONVERTED_DIR / f"{photo.id}.jpg"):
         if path.exists():
@@ -552,4 +731,54 @@ def run_vlm_analysis_job(photo_id: uuid.UUID) -> None:
     finally:
         if lock_acquired:
             locks.release_photo_lock(db, locks.PHOTOAI_LOCK_CLASS_VLM, photo_id)
+        db.close()
+
+
+def run_semantic_index_job(photo_id: uuid.UUID) -> None:
+    """semantic_index isinin worker giris noktasi.
+
+    VLM JSON analizinden (photo_analysis) bir metin embedding'i uretip Qdrant
+    'photo_semantic' koleksiyonuna + photo_embeddings izleme tablosuna yazar
+    (bkz. semantic_service.index_photo).
+
+    IDEMPOTENT: index_photo hem Qdrant upsert hem photo_embeddings ON CONFLICT
+    kullanir - at-least-once tekrari zararsiz, ustune yazar.
+
+    PR-2: photo-scoped advisory lock (PHOTOAI_LOCK_CLASS_SEMANTIC) - face/vlm
+    ile AYNI photo_id icin bile birbirini BEKLEMEZ (farkli classid; uc is
+    tipi bagimsiz tablolara yaziyor).
+
+    photo_analysis HENUZ yoksa (index_photo False): analiz isi (vlm_analysis)
+    henuz bitmemis demektir - LockConflict'e cevrilir; worker/main.py'nin
+    VAR OLAN hatti cezasiz + backoff'lu requeue yapar. Normalde bu is zaten
+    run_vlm_analysis BASARIYLA bittikten SONRA enqueue edilir (analiz coktan
+    vardir); bu dal yalnizca at-least-once yeniden siralama / reaper
+    senaryolari icin bir emniyet.
+    """
+    from app.db.session import SessionLocal
+
+    if not settings.SEMANTIC_SEARCH_ENABLED:
+        return  # ozellik kapali - is no-op olarak tamamlanir
+
+    db = SessionLocal()
+    lock_acquired = False
+    try:
+        photo = db.query(Photo).filter(Photo.id == photo_id).first()
+        if photo is None:
+            return
+
+        lock_acquired = locks.acquire_photo_lock(
+            db, locks.PHOTOAI_LOCK_CLASS_SEMANTIC, photo_id
+        )
+        if not lock_acquired:
+            raise LockConflict(f"semantic_index: photo {photo_id} baska bir worker'da")
+
+        if not semantic_service.index_photo(db, photo_id):
+            raise LockConflict(
+                f"semantic_index: photo {photo_id} icin VLM analizi henuz hazir degil"
+            )
+        db.commit()
+    finally:
+        if lock_acquired:
+            locks.release_photo_lock(db, locks.PHOTOAI_LOCK_CLASS_SEMANTIC, photo_id)
         db.close()

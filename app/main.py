@@ -10,9 +10,11 @@ from sqlalchemy import text
 from app.core.exceptions import ServiceError, service_error_handler
 from app.core.settings import settings
 from app.db.qdrant import ensure_collections
-from app.db import qdrant
+from app.db import jobs_repository, qdrant
 from app.db.session import SessionLocal
+from app.ingestion.main import loop as ingestion_loop
 from app.routers import albums, auth, faces, jobs, photos, system, users
+from app.services import ingestion_service
 
 logger = logging.getLogger("photoai")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -21,14 +23,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_collections()
-    yield
+    # Inbox ingestion dongusu backend ile BIRLIKTE baslar (spec 15): ayri
+    # bir servis/pencere yonetmeye gerek kalmadan, backend her yeniden
+    # baslatildiginda inbox taranir, yarim kalmis islemler uzlastirilir ve
+    # DB'ye alinmamis dosyalar islenmeye devam eder.
+    if settings.INGESTION_ENABLED:
+        ingestion_loop.start()
+    else:
+        logger.warning(
+            "INGESTION_ENABLED=false - inbox dongusu BASLATILMADI. Yuklenen "
+            "fotograflar uploads/inbox'ta birikir ve islenmez "
+            "(ayri surec: python -m app.ingestion.main)."
+        )
+    try:
+        yield
+    finally:
+        if settings.INGESTION_ENABLED:
+            ingestion_loop.stop()
 
 
 app = FastAPI(title="PhotoAI", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,6 +146,49 @@ def _check_vlm() -> dict:
         return {"status": "error", "detail": str(e)}
 
 
+def _check_workers() -> dict:
+    """Her BILINEN is tipi icin worker surecinin canliligi (worker_heartbeats
+    tablosundan) - ok | stale | down. Bostaki worker'i da yakalar; kuyruk
+    bos olsa bile "semantic_index worker calisiyor mu" sorusunu yanitlar.
+
+    DB erisilemezse worker durumu da bilinemez - sessiz {} yerine acik
+    hata dondurulur (cagiran degraded sayar)."""
+    try:
+        return jobs_repository.worker_liveness(settings.WORKER_HEARTBEAT_STALE_SECONDS)
+    except Exception as e:
+        return {"error": {"status": "error", "detail": str(e)}}
+
+
+def _ingestion_report() -> dict:
+    """Spec 14 - ingestion gozlemlenebilirligi. Mevcut /health zaten
+    operatorun baktigi tek ekran (frontend HealthBanner + Sistem sayfasi);
+    ayri bir metrik ucu ACMAK yerine oraya eklendi.
+
+    `ready` surekli buyuyorsa dongu takilmis demektir; `orphan_meta` > 0
+    ise commit/tasima arasinda bir crash yasanmis ve bir sonraki
+    uzlastirmayi bekliyor demektir."""
+    if not settings.INGESTION_ENABLED:
+        return {"status": "disabled"}
+    try:
+        # IKI FARKLI KAVRAM, AYRI ISIMLER ALTINDA.
+        #
+        # Onceki hali ikisini duz birlestiriyordu ve `failed` anahtari
+        # CAKISIYORDU: inbox_stats()["failed"] (failed/ klasorundeki DOSYA
+        # sayisi) sessizce loop.stats["failed"] (surec basladigindan beri
+        # KUMULATIF basarisiz ingest sayisi) tarafindan eziliyordu. Operator
+        # "failed: 3" gorup klasore bakinca orayi BOS buluyordu.
+        return {
+            "status": "ok",
+            # ANLIK durum - inbox/failed klasorlerinin o andaki icerigi
+            "inbox": ingestion_service.inbox_stats(),
+            # KUMULATIF sayaclar - bu surec basladigindan beri
+            "totals": dict(ingestion_loop.stats),
+            "last_reconcile_at": ingestion_loop.last_reconcile_at,
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 @app.get("/health")
 def health():
     checks = {
@@ -135,5 +196,14 @@ def health():
         "qdrant": _check_qdrant(),
         "vlm": _check_vlm(),
     }
-    overall = "ok" if all(c["status"] == "ok" for c in checks.values()) else "degraded"
-    return {"status": overall, "checks": checks}
+    # workers: {job_type: {status: ok|stale|down, workers, last_seen, seconds_since}}
+    workers = _check_workers()
+    deps_ok = all(c["status"] == "ok" for c in checks.values())
+    workers_ok = all(w["status"] == "ok" for w in workers.values())
+    overall = "ok" if deps_ok and workers_ok else "degraded"
+    return {
+        "status": overall,
+        "checks": checks,
+        "workers": workers,
+        "ingestion": _ingestion_report(),
+    }

@@ -98,10 +98,32 @@ uvicorn app.main:app --reload --reload-dir app --port 8001
 > (yeniden başlatmadan temizlenememesi) nedeniyle kalıcı olarak taşındı.
 > Frontend'in `VITE_API_URL` değeri bununla eşleşmeli.
 
-Fotoğraf yükleme artık **senkron değil**: `POST /photos` sadece dosyayı
-kaydedip iki işi (`face_pipeline`, `vlm_analysis`) kuyruğa yazar ve `202`
-döner. Bu işlerin gerçekten işlenmesi için ayrı worker süreçlerinin de
-çalışıyor olması gerekir:
+Fotoğraf yükleme **üç aşamalı** ve hiçbir aşamada senkron AI işlemesi yok:
+
+```
+POST /photos ──► uploads/inbox/{id}.ext        (akış halinde yazım,
+     │                 + {id}.ext.meta.json     .part → atomic rename)
+     │           202 döner: dosya artık DİSKTE TAMAMLANMIŞ,
+     │           tarayıcıdan bağımsız
+     ▼
+ingestion ────► photos + photo_exif + face_pipeline + vlm_analysis
+(backend içi     TEK atomik commit; sonra dosya uploads/stored/'a taşınır
+ arka plan       (sıra tersine: taşıma commit'ten ÖNCE, meta silme SONRA —
+ döngüsü)         gerekçe: app/services/ingestion_service.py başlığı)
+     ▼
+worker'lar ───► yüz hattı / VLM / semantik indeks (DB kuyruğunu tüketir)
+```
+
+Ingestion döngüsü backend süreci içinde başlar (`app/main.py` lifespan) —
+ayrı bir pencere gerekmez, backend her yeniden başladığında inbox taranır ve
+yarım kalmış işlemler uzlaştırılır. `INGESTION_ENABLED=false` ile kapatılıp
+`python -m app.ingestion.main` olarak ayrı süreçte de çalıştırılabilir.
+
+**100 fotoğrafın tamamı beklenmez**: her fotoğraf kendi isteğinde
+kalıcılaşır, ingestion onu tek tek işler ve worker'lar hemen alabilir —
+upload ile işleme eşzamanlı ilerler.
+
+Worker süreçlerinin ayrıca çalışıyor olması gerekir:
 
 ```bash
 set JOB_TYPES=vlm_analysis  && python -m app.worker.main   # worker-vlm
@@ -122,6 +144,12 @@ curl http://localhost:8001/health
 ```
 
 `database`, `qdrant`, `vlm` bağımlılıklarının her biri ayrı ayrı raporlanır.
+Ayrıca `workers` alanı her iş tipi (`face_pipeline`, `vlm_analysis`,
+`semantic_index`) için worker sürecinin canlılığını gösterir:
+`ok` (son ~15 sn içinde heartbeat), `stale` (kayıt var ama heartbeat eskimiş)
+veya `down` (o tip için hiç worker başlamamış). Aynı bilgi
+`GET /jobs/queue-status` yanıtındaki `workers` alanında da döner (Genel
+Bakış paneli buradan okur — kuyruk boş olsa bile worker durumu görünür).
 
 ## API Uçları (özet)
 
@@ -135,7 +163,7 @@ Tam istek/cevap şemaları için servis ayaktayken `http://localhost:8001/docs`
 | `/photos` | `photos.py` | yükleme (`202`, asenkron), listeleme, tekil/toplu durum sorgusu, dosya/silme | Bearer |
 | `/jobs` | `jobs.py` | tekil iş durumu, kuyruk durumu + ETA | Bearer |
 | (prefix yok) | `faces.py` | kümeler, kişiler, etiketleme, birleştirme, yüz yeniden atama, birleştirme önerileri | Bearer |
-| `/health` | `main.py` | database/qdrant/vlm bağımsız sağlık kontrolü | - |
+| `/health` | `main.py` | database/qdrant/vlm bağımsız sağlık kontrolü + worker canlılığı (`workers`) | - |
 
 ## Proje Yapısı
 
@@ -199,6 +227,11 @@ app/
                              # claim → çalıştır → complete/fail döngüsü, heartbeat,
                              # reaper, graceful shutdown (SIGTERM/SIGINT)
 
+  ingestion/
+    main.py                 # Inbox izleme döngüsü: hızlı yoklama + periyodik
+                             # uzlaştırma (crash kurtarma). Backend lifespan'inde
+                             # arka plan thread'i olarak başlar.
+
 alembic/
   versions/                # Veritabanı migrasyonları (kronolojik) — auth,
                             # yüz tanıma tabloları, iş kuyruğu, indeks/kolon eklemeleri
@@ -220,6 +253,23 @@ requirements.txt            # pip freeze ile üretilmiş tam bağımlılık list
 `uploads/`, `models/`, `reports/`, `logs/` klasörleri çalışma zamanı verisi/
 çıktısıdır, koda dahil değildir ve `.gitignore` ile hariç tutulur (bkz.
 o dosyadaki gerekçe notları).
+
+`uploads/` içindeki yerleşim:
+
+```
+uploads/
+├── inbox/       POST /photos'un yazdığı, henüz DB'ye alınmamış dosyalar
+│                (+ .part = yazılıyor, + .meta.json = ingestion bitmedi)
+├── stored/      ingestion tamamlanmış, kalıcı fotoğraflar
+├── failed/      kalıcı olarak işlenemeyen dosyalar (elle inceleme için)
+├── converted/   HEIC → JPG önizleme türevleri
+└── {uuid}.ext   inbox mimarisinden ÖNCE yüklenmiş fotoğraflar —
+                 taşınmadı, `Photo.storage_path` üzerinden çalışmaya devam eder
+```
+
+Inbox/ingestion durumu `GET /health` yanıtındaki `ingestion` alanında
+görünür (`ready`, `in_progress`, `orphan_meta`, `failed`, işlenen sayıları,
+son uzlaştırma zamanı).
 
 ## Bilinen Sınırlamalar
 

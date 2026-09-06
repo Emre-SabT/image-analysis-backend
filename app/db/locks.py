@@ -67,6 +67,11 @@ logger = logging.getLogger("photoai.locks")
 # sabit iki tam sayi olmalari yeterli.
 PHOTOAI_LOCK_CLASS_FACE = 913001
 PHOTOAI_LOCK_CLASS_VLM = 913002
+# semantic_index isi - face/vlm ile AYNI photo_id icin bile birbirini
+# BEKLEMEZ (farkli classid). Kod tabaninda advisory lock alan baska yer
+# YOK (merge/label/reassign satir-seviyesi SELECT FOR UPDATE kullanir -
+# bkz. identity_locks.py), bu deger 913001/913002 ile cakismaz.
+PHOTOAI_LOCK_CLASS_SEMANTIC = 913003
 
 
 def acquire_photo_lock(db: Session, classid: int, photo_id: uuid.UUID) -> bool:
@@ -87,6 +92,40 @@ def acquire_photo_lock(db: Session, classid: int, photo_id: uuid.UUID) -> bool:
         db.execute(
             text("SELECT pg_try_advisory_lock(:classid, hashtext(CAST(:photo_id AS text)))"),
             {"classid": classid, "photo_id": str(photo_id)},
+        ).scalar()
+    )
+
+
+def acquire_content_lock(db: Session, classid: int, content_hash: str) -> bool:
+    """acquire_photo_lock'in ICERIK-scoped esi (ingestion icin).
+
+    Neden photo_id degil content_hash: ingestion'da korunmasi gereken kaynak
+    "bu icerik"tir. Ayni fotografin iki FARKLI inbox dosyasi (iki farkli
+    photo_id) ayni anda islenirse ikisi de "kayit yok" gorup INSERT etmeye
+    calisirdi; photo_id-scoped bir kilit bunu ENGELLEMEZDI.
+
+    TRANSACTION-SCOPED (pg_try_advisory_xact_lock) - acquire_photo_lock'un
+    session-scoped'undan BILINCLI OLARAK FARKLI. Kilit, cagiran transaction
+    commit ya da rollback olunca POSTGRES TARAFINDAN otomatik birakilir;
+    eslesen bir unlock cagrisi YOKTUR (o yuzden release_content_lock de yok).
+
+    NEDEN (gelistirme sirasinda YASANMIS bir hata):
+      Session-scoped ilk denemede, hata yolundaki `db.rollback()` SQLAlchemy
+      baglantiyi HAVUZA IADE ETTIGI icin, ardindan cagrilan unlock BASKA bir
+      baglantida calisiyordu. Kilit, havuzdaki eski baglantida SIZILI
+      kaliyordu ve o content_hash bir daha ASLA ingest edilemiyordu (testte
+      'lock conflict' olarak yakalandi). Transaction-scoped kilitte bu hata
+      sinifi YAPISAL OLARAK imkansiz: rollback zaten kilidi birakir.
+
+    Kritik bolum tam olarak transaction'dir (SELECT ... -> INSERT -> COMMIT),
+    dolayisiyla kilidin omru ile korunan bolgenin omru BIREBIR ortusur.
+
+    Bloke ETMEZ (pg_try_* ailesi) - bkz. tests/test_advisory_locks.py.
+    """
+    return bool(
+        db.execute(
+            text("SELECT pg_try_advisory_xact_lock(:classid, hashtext(:content_hash))"),
+            {"classid": classid, "content_hash": content_hash},
         ).scalar()
     )
 

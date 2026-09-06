@@ -44,17 +44,24 @@ class Photo(Base):
     filename = Column(String, nullable=False)
     storage_path = Column(String, nullable=False)
     status = Column(String, default="uploaded")  # uploaded -> processing -> analyzed -> failed
-    # Dosya tekillestirme: yuklenen dosyanin SHA-256'si (photo_service.save_upload).
+    # Dosya tekillestirme: yuklenen dosyanin SHA-256'si.
     # Nullable: migration'dan once yuklenmis eski kayitlar scripts/backfill_content_hash.py
     # calistirilana kadar NULL kalir - o ana kadar duplicate kontrolune dahil olmazlar.
     #
-    # UNIQUE DEGIL (bilincli): backfill sirasinda bu ozellik eklenmeden once
-    # yuklenmis 7 grup halihazirda yinelenen fotograf bulundu (ayni icerik,
-    # farkli klasor/isimle iki kez yuklenmis). Unique kisit bu satirlarin
-    # hash'ini doldururken commit'i patlatirdi. Tekillestirme uygulama
-    # katmaninda (save_upload) zaten yapiliyor; DB'de sadece sorgu icin
-    # (WHERE content_hash = ...) duz bir index yeterli.
-    content_hash = Column(String(64), nullable=True, index=True)
+    # ARTIK UNIQUE (migration b4d7e2a9c153). Onceki yorum "UNIQUE DEGIL,
+    # cunku 7 grup yinelenen eski fotograf var" diyordu; o gruplar o
+    # zamandan beri temizlendi (migration oncesi olcum: 483 satir, 483
+    # tekil hash, 0 NULL) ve kisit guvenle eklendi.
+    #
+    # NEDEN GEREKLI: tekillestirme artik YALNIZCA uygulama katmaninda
+    # ("once SELECT sonra INSERT") degil. Yukleme eszamanliligi 3'ten
+    # 12'ye cikti ve ingestion ayri bir donguye tasindi - iki es zamanli
+    # yol ayni hash icin "kayit yok" gorup ikisi de INSERT edebilirdi.
+    # Advisory kilit bunu ONLER, ama SON SOZ veritabaninindir.
+    #
+    # NULL'lar kisitin DISINDADIR (Postgres'te birden fazla NULL unique
+    # index'i ihlal etmez) - eski hash'siz kayitlar etkilenmez.
+    content_hash = Column(String(64), nullable=True, index=True, unique=True)
     # Coklu kullanici gecisinden ONCE yuklenmis fotograflarda NULL kalir -
     # sahte sahiplik uydurulmadi (bkz. migration c1e9a2f6b3d4).
     uploaded_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
@@ -253,9 +260,15 @@ class AlbumPhoto(Base):
 
 JOB_TYPE_FACE_PIPELINE = "face_pipeline"
 JOB_TYPE_VLM_ANALYSIS = "vlm_analysis"
+# Semantik arama indeksleme - vlm_analysis BASARIYLA bittikten SONRA
+# kuyruga alinir (photo_service.run_vlm_analysis). face/vlm ile BAGIMSIZ
+# ucuncu bir hat: basarisiz olmasi VLM/yuz verisini etkilemez.
+JOB_TYPE_SEMANTIC_INDEX = "semantic_index"
 
 # Worker'in JOB_TYPES dogrulamasi bu kumeye karsi yapilir (fail-fast).
-KNOWN_JOB_TYPES = frozenset({JOB_TYPE_FACE_PIPELINE, JOB_TYPE_VLM_ANALYSIS})
+KNOWN_JOB_TYPES = frozenset(
+    {JOB_TYPE_FACE_PIPELINE, JOB_TYPE_VLM_ANALYSIS, JOB_TYPE_SEMANTIC_INDEX}
+)
 
 JOB_STATUS_QUEUED = "queued"
 JOB_STATUS_RUNNING = "running"
@@ -319,3 +332,25 @@ class UserJobCounter(Base):
 
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
     next_sequence = Column(BigInteger, nullable=False, server_default=text("0"))
+
+
+class WorkerHeartbeat(Base):
+    """Worker sureclerinin "hayattayim" kaydi - GOZLEM tablosu, veri deposu
+    DEGIL (bkz. migration a2c4e6f8b0d1).
+
+    Her worker sur, JOB_TYPES'ini ve last_seen'ini periyodik olarak upsert
+    eder (worker/main.py `_maybe_heartbeat`). `/health` ve
+    `/jobs/queue-status` bunu okuyup her is tipi icin "worker calisiyor mu"
+    bilgisini uretir (jobs_repository.worker_liveness).
+
+    worker_id surec kimligi ({hostname}-{pid}) - restart'ta degisir, eski
+    satirlar reaper dongusunde (jobs_repository.prune_stale_heartbeats)
+    temizlenir. Zaman kolonlari TIMESTAMPTZ - `jobs` ile ayni gerekce.
+    """
+
+    __tablename__ = "worker_heartbeats"
+
+    worker_id = Column(Text, primary_key=True)
+    job_types = Column(Text, nullable=False)  # virgulle ayrilmis
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

@@ -52,6 +52,7 @@ from app.db.models import (
     JOB_STATUS_FAILED,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
+    KNOWN_JOB_TYPES,
     Job,
 )
 from app.db.session import SessionLocal
@@ -561,4 +562,133 @@ def photo_job_statuses(
             # created_at ASC siralamasi sayesinde ayni (foto, tip) icin
             # birden fazla satir olursa EN YENISI kazanir.
             out[pid][key] = row["status"]
+    return out
+
+
+# --- Worker canlilik gozlemi (worker_heartbeats) ----------------------
+#
+# JOB tablosu "is kimde" der ama BOSTAKI worker oradan gorunmez. Bu blok,
+# her worker surecinin periyodik yazdigi "hayattayim" kaydini yonetir;
+# /health (Sistem durumu) ve /jobs/queue-status (Genel Bakis) bunu okuyup
+# her is tipi icin worker'in calisip calismadigini gosterir.
+
+WORKER_STATUS_OK = "ok"        # son vurus esik icinde
+WORKER_STATUS_STALE = "stale"  # kayit var ama vurus eskimis (worker takildi/oldu)
+WORKER_STATUS_DOWN = "down"    # o is tipi icin HIC kayit yok (worker hic baslamadi)
+
+
+def record_heartbeat(worker_id: str, job_types_csv: str) -> None:
+    """Worker surecinin "hayattayim" kaydini upsert eder (last_seen = now()).
+
+    KENDI KISA transaction'inda calisir - ana claim/handler dongusunden
+    bagimsiz, hata verirse worker'i durdurmaz (cagiran genis except ile
+    sarar).
+    """
+    db = SessionLocal()
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO worker_heartbeats (worker_id, job_types, started_at, last_seen)
+                VALUES (:wid, :jt, now(), now())
+                ON CONFLICT (worker_id) DO UPDATE
+                    SET job_types = EXCLUDED.job_types,
+                        last_seen = now()
+                """
+            ),
+            {"wid": worker_id, "jt": job_types_csv},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def clear_heartbeat(worker_id: str) -> None:
+    """Graceful shutdown'da kaydi siler - worker BILEREK durdu, "stale"
+    gorunmesin. Best-effort (SIGKILL / crash'te calismaz; o durumu
+    prune_stale_heartbeats + STALE esigi yakalar)."""
+    db = SessionLocal()
+    try:
+        db.execute(
+            text("DELETE FROM worker_heartbeats WHERE worker_id = :wid"),
+            {"wid": worker_id},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def prune_stale_heartbeats(older_than_seconds: int, session: Session | None = None) -> int:
+    """worker_id restart'ta degistigi icin olu worker satirlari birikir -
+    cok eski (bu esikten yasli) kayitlari siler. Reaper dongusunden
+    cagrilir. Esik STALE'den COK daha buyuk olmali (bir worker'in gecici
+    takilmasini 'olu' sayip erken silmeyelim)."""
+    own = session is None
+    db = session or SessionLocal()
+    try:
+        result = db.execute(
+            text(
+                "DELETE FROM worker_heartbeats "
+                "WHERE last_seen < now() - (:age || ' seconds')::interval"
+            ),
+            {"age": older_than_seconds},
+        )
+        db.commit()
+        return result.rowcount
+    finally:
+        if own:
+            db.close()
+
+
+def worker_liveness(
+    stale_seconds: int, session: Session | None = None
+) -> dict[str, dict]:
+    """Her BILINEN is tipi icin worker durumu.
+
+    Donus: {job_type: {"status": ok|stale|down, "workers": N,
+                       "last_seen": iso|None, "seconds_since": float|None}}
+
+    - status=down  -> o tip icin hic heartbeat satiri yok (worker hic
+                      baslamadi ya da JOB_TYPES'inda bu tip yok).
+    - status=stale -> satir var ama en taze vurus stale_seconds'tan eski.
+    - status=ok    -> en taze vurus esik icinde.
+
+    Bir worker coklu tip tuketebilir (job_types virgulle ayrilmis) - o
+    satir tukettigi HER tipe sayilir.
+    """
+    own = session is None
+    db = session or SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT worker_id, job_types, last_seen,
+                       EXTRACT(EPOCH FROM (now() - last_seen)) AS age_seconds
+                FROM worker_heartbeats
+                """
+            )
+        ).mappings().all()
+    finally:
+        if own:
+            db.close()
+
+    out: dict[str, dict] = {
+        jt: {"status": WORKER_STATUS_DOWN, "workers": 0,
+             "last_seen": None, "seconds_since": None}
+        for jt in sorted(KNOWN_JOB_TYPES)
+    }
+    for row in rows:
+        age = float(row["age_seconds"])
+        for jt in (t.strip() for t in row["job_types"].split(",") if t.strip()):
+            if jt not in out:
+                continue
+            entry = out[jt]
+            entry["workers"] += 1
+            # En TAZE vurusu tut (birden fazla worker ayni tipi tuketebilir).
+            if entry["seconds_since"] is None or age < entry["seconds_since"]:
+                entry["seconds_since"] = round(age, 1)
+                entry["last_seen"] = row["last_seen"].isoformat()
+                entry["status"] = (
+                    WORKER_STATUS_OK if age <= stale_seconds else WORKER_STATUS_STALE
+                )
     return out

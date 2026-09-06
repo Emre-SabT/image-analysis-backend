@@ -1,3 +1,4 @@
+import logging
 import uuid
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, require_role
+from app.core.settings import settings
 from app.core.time import to_iso_utc
 from app.db import jobs_repository
 from app.db.models import (
@@ -14,7 +16,9 @@ from app.db.models import (
     User,
 )
 from app.db.session import get_db
-from app.services import face_service, photo_service
+from app.services import face_service, photo_service, semantic_service
+
+logger = logging.getLogger("photoai.routers.photos")
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 
@@ -110,10 +114,23 @@ def _to_dict(photo, analysis, faces=None, uploaded_by: User | None = None, exif=
 # (dosya yazma, hash, DB). `def` olunca FastAPI endpoint'i threadpool'da
 # calistirir.
 #
-# ARTIK ISLEME YOK, YALNIZCA KUYRUGA ALMA: hem yuz hatti hem VLM analizi
-# kalici kuyruga (jobs tablosu) yaziliyor ve ayri worker sureclerinde
-# calisiyor. Onceki tasarimda yuz hatti istek ICINDE senkron calisiyordu;
-# 500+ fotografli toplu yuklemede bu zaman asimi ve is kaybi demekti.
+# UC ASAMALI MIMARI - bu uc, YALNIZCA ILK asamadir:
+#
+#   1. UPLOAD (burasi)  dosyayi uploads/inbox'a akis halinde yazar, atomic
+#                       rename ile tamamlar. DB'ye HICBIR SEY yazmaz.
+#   2. INGESTION        ayri dongu (app/ingestion/main.py) inbox'u izler,
+#                       Photo + EXIF + 2 is kaydini TEK commit'te olusturur.
+#   3. WORKER           is kuyrugunu (FOR UPDATE SKIP LOCKED) tuketir.
+#
+# Neden boyle: "202 dondum" ile "fotograf gercekten kalici" arasindaki
+# butun belirsizlik kalkti. Bu uc, dosya DISKTE TAMAMLANMIS halde
+# bulunmadan basari donmez; o andan itibaren fotograf tarayicidan
+# TAMAMEN bagimsizdir - sekme kapansa, ag kopsa, backend yeniden baslasa
+# bile ingestion onu bulup isler.
+#
+# ISTEK ICINDE AI YOK: yuz hatti, VLM ve semantik indeksleme worker
+# sureclerinde calisir. 500+ fotografli toplu yuklemede istek icinde
+# isleme, zaman asimi ve is kaybi demekti.
 @router.post("", status_code=202, dependencies=[Depends(require_role("admin", "editor"))])
 def upload_photo(
     file: UploadFile = File(...),
@@ -127,13 +144,15 @@ def upload_photo(
             detail=f"Desteklenmeyen format: {ext}. Izin verilen: JPEG, PNG, WEBP, HEIC",
         )
 
-    photo, is_duplicate = photo_service.save_upload(db, file, current_user.id)
+    received = photo_service.receive_upload(db, file, current_user.id)
 
-    if is_duplicate:
-        # Ayni icerik (SHA-256) daha once yuklenmis: yeni is KUYRUGA ALINMAZ,
-        # mevcut fotografin guncel hali donulur (ne yuz hatti ne VLM tekrar
-        # calisir).
-        db.commit()
+    if received.duplicate:
+        # Ayni icerik (SHA-256) daha once yuklenmis. Hash zaten akis
+        # sirasinda hesaplandigi icin bu kontrol EK MALIYETSIZ ve
+        # kullanicinin "Zaten arsivde" yanitini ANINDA almasini saglar.
+        # (Asil tekillik garantisi DB'deki UNIQUE(content_hash); bu bir
+        # on elemedir - bkz. photo_service.receive_upload.)
+        photo = received.existing
         _, analysis = photo_service.get_photo_with_analysis(db, photo.id)
         faces = face_service.get_faces_for_photo(db, photo.id)
         # Mevcut (ilk) fotografin YUKLEYICISI - `current_user` DEGIL: ayni
@@ -149,29 +168,16 @@ def upload_photo(
         data["duplicate"] = True
         return data
 
-    # IKI BAGIMSIZ IS. Aralarinda sira/bagimlilik YOK, paralel calisabilirler;
-    # biri fail olursa digeri etkilenmez ("yuz verisi VLM hatasindan
-    # etkilenmez, kismi basari gecerlidir" ilkesi korunuyor).
-    face_job_id = jobs_repository.enqueue(
-        db, JOB_TYPE_FACE_PIPELINE, {"photo_id": str(photo.id)}, current_user.id
-    )
-    vlm_job_id = jobs_repository.enqueue(
-        db, JOB_TYPE_VLM_ANALYSIS, {"photo_id": str(photo.id)}, current_user.id
-    )
-
-    # ATOMIK: foto satiri + 2 job satiri + 2 sayac artirimi TEK commit'te.
-    # Job insert patlarsa foto insert de geri alinir (save_upload artik
-    # commit degil flush yapiyor).
-    db.commit()
-
+    # face_job_id / vlm_job_id ARTIK DONMUYOR (tip tanimlarinda zaten
+    # optional'di): is kayitlari ingestion asamasinda olusuyor, bu uc
+    # onlarin id'sini goremez. Istemci ilerlemeyi GET /photos/status ile
+    # izler - toplu yuklemede zaten oyle yapiyordu.
     return {
-        "photo_id": str(photo.id),
-        "filename": photo.filename,
-        "status": photo.status,
+        "photo_id": str(received.photo_id),
+        "filename": received.filename,
+        "status": "received",
         "duplicate": False,
         "uploaded_by": _user_ref(current_user),
-        "face_job_id": str(face_job_id),
-        "vlm_job_id": str(vlm_job_id),
     }
 
 
@@ -202,6 +208,42 @@ def photos_status_batch(ids: str, db: Session = Depends(get_db)):
         for pid in photo_ids
         if pid in statuses
     ]
+
+
+@router.get("/search", dependencies=[Depends(get_current_user)])
+def search_photos(q: str, limit: int = 200, db: Session = Depends(get_db)):
+    """Semantik arama - VLM JSON analizinden uretilmis metin embedding'leri
+    uzerinde vektor benzerligiyle siralar (bkz. semantic_service.search).
+
+    ROTA SIRASI: "/photos/{photo_id}/..." rotalarindan ONCE tanimli olmali
+    (bkz. yukaridaki "/photos/status" notu - ayni gerekce).
+
+    Donus: [{"photo_id", "score"}] - skora gore azalan. SADECE id + skor
+    (tam Photo DEGIL): istemci zaten GET /photos ile tum listeyi tutuyor,
+    bu id kumesini kendi facet filtreleriyle daraltip siralar.
+
+    Hata sozlesmesi (frontend bunlarda istemci-tarafli substring aramasina
+    DUSER):
+      503 - ozellik kapali (SEMANTIC_SEARCH_ENABLED=False)
+      502 - embedding modeli / Qdrant erisilemez
+    """
+    if not settings.SEMANTIC_SEARCH_ENABLED:
+        raise HTTPException(status_code=503, detail="Semantik arama kapali")
+
+    limit = max(1, min(limit, settings.SEMANTIC_SEARCH_TOP_K))
+    try:
+        # Alaka esigi: SEMANTIC_SEARCH_MIN_SCORE altindaki zayif komsular
+        # hic donulmez (sonuc listesi bos gelebilir - frontend bunu
+        # "eslesme yok" olarak gosterir, istemci substring aramasina
+        # DUSMEZ; o dusus yalnizca 502/503'te olur).
+        hits = semantic_service.search(q, limit, settings.SEMANTIC_SEARCH_MIN_SCORE)
+    except Exception as e:
+        logger.warning("Semantik arama basarisiz (q=%r): %s: %s", q, type(e).__name__, e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Semantik arama gecici olarak kullanilamiyor ({type(e).__name__})",
+        )
+    return [{"photo_id": pid, "score": score} for pid, score in hits]
 
 
 @router.get("/{photo_id}/status", dependencies=[Depends(get_current_user)])

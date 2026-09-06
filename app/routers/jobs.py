@@ -22,6 +22,13 @@ def queue_status(
     face (~0,13 sn) ve vlm (~8-20 sn) sureleri buyuklukce farkli oldugu icin
     KARISIK TEK ORTALAMA verilmiyor. Tahmini sure sabit bir varsayim degil,
     son N tamamlanmis isin OLCULEN ortalamasindan hesaplaniyor.
+
+    `workers`: her BILINEN is tipi icin worker surecinin canliligi
+    (ok | stale | down). `by_type`'tan BAGIMSIZ ve HER ZAMAN tam liste:
+    kuyruk bos olsa da "semantic_index worker calisiyor mu" Genel Bakis'ta
+    gorunsun (ozellikle otomatik semantic_index isleri SYSTEM_USER_ID
+    altinda kuyruga girdigi icin normal kullanicinin `by_type`'inda hic
+    gorunmez).
     """
     by_type = jobs_repository.queue_status_by_type(
         current_user.id, settings.JOB_ETA_SAMPLE_SIZE, session=db
@@ -29,6 +36,9 @@ def queue_status(
     return {
         "by_type": by_type,
         "total_queued": sum(v["queued"] for v in by_type.values()),
+        "workers": jobs_repository.worker_liveness(
+            settings.WORKER_HEARTBEAT_STALE_SECONDS, session=db
+        ),
     }
 
 

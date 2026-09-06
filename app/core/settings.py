@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     JOB_STALE_TIMEOUT_SECONDS: int = 300
     JOB_POLL_INTERVAL_SECONDS: float = 1.0
     JOB_REAP_INTERVAL_SECONDS: int = 60
+    # --- Worker CANLILIK gozlemi (JOB_HEARTBEAT_SECONDS'tan AYRI kavram) ---
+    # JOB_HEARTBEAT_SECONDS calisan bir ISIN kilidini tazeler; asagidakiler
+    # WORKER SURECININ kendisinin ayakta oldugunu (bosta bile) worker_heartbeats
+    # tablosuna yazar. /health ve /jobs/queue-status bunu okur.
+    #
+    # WRITE cadence STALE esiginin belirgin altinda olmali ki saglikli bir
+    # worker asla "stale" gorunmesin (15 sn << 45 sn = 3 kacan vurus).
+    WORKER_HEARTBEAT_INTERVAL_SECONDS: int = 15
+    WORKER_HEARTBEAT_STALE_SECONDS: int = 45
     # PR-2 (photo-scoped advisory lock, henuz uygulanmadi) icin taban
     # bekleme suresi: baska bir worker ayni photo_id/is tipini O ANDA
     # isliyorsa is bu kadar + jitter sonra tekrar denenir. BILINCLI
@@ -146,12 +155,105 @@ class Settings(BaseSettings):
     # sorunu cozulmeli - bkz. jobs_repository.py basindaki TODO.
     WORKER_FACE_PROCESSES: int = 1
 
+    # --- Semantik arama (metin embedding + Qdrant 'photo_semantic') ---
+    #
+    # VLM'in urettigi JSON analizi (photo_analysis) tek bir metin dokumanina
+    # cevrilip embed edilir; vektor Qdrant 'photo_semantic' koleksiyonunda
+    # tutulur (bkz. app/services/semantic_service.py). Arama ucu sorguyu ayni
+    # modelle embed edip vektor benzerligiyle siralar; hata/model erisilemez
+    # ise frontend istemci-tarafli substring aramasina (matchesSearch) duser.
+    SEMANTIC_SEARCH_ENABLED: bool = True
+    # "local"  : yerel intfloat/multilingual-e5-base, GPU'da (VLM Bedrock'a
+    #            tasindigi icin GPU bosta). VARSAYILAN.
+    # "bedrock": AWS Bedrock Titan Text Embeddings V2 - ileride tek ayarla
+    #            gecis opsiyonu; kod hazir tutulur ama varsayilan degil.
+    EMBEDDING_PROVIDER: str = "local"
+    EMBEDDING_MODEL_DIR: str = "models/multilingual-e5-base"
+    EMBEDDING_DEVICE: str = "cuda"  # local provider: "cuda" | "cpu"
+    # Qdrant 'photo_semantic' koleksiyonunun vektor boyutu: local e5-base=768,
+    # bedrock titan-v2=1024. DEGISTIRILIRSE koleksiyon dusurulup backfill
+    # yeniden calistirilmali - qdrant.ensure_collections() boyut uyusmazligini
+    # UYGULAMA BASLANGICINDA REDDEDER.
+    EMBEDDING_DIM: int = 768
+    AWS_BEDROCK_EMBED_MODEL_ID: str = "amazon.titan-embed-text-v2:0"
+    # Arama ucunun dondurebilecegi en fazla aday sayisi (frontend bu id
+    # kumesini kendi facet filtreleriyle daraltir).
+    SEMANTIC_SEARCH_TOP_K: int = 200
+    # Alaka esigi (Qdrant Cosine skoru, 0..1). Bu degerin ALTINDA kalan
+    # sonuclar hic donulmez - onceki davranista esik YOKTU, bu yuzden
+    # gorsel karsiligi olmayan soyut bir sorgu ("yuksek lisans tezi
+    # yazarken") bile TOP_K kadar zayif komsu donduruyordu. 0.0 = esik
+    # kapali (eski davranis).
+    #
+    # NOT (e5-base kalibrasyonu): multilingual-e5-base normalize edilmis
+    # vektorlerde ALAKASIZ ciftler bile tipik olarak ~0.70-0.78 skor alir,
+    # bu yuzden 0.50 gibi bir esik pratikte HICBIR SEYI elemez. Ayirt
+    # edici aralik ~0.80-0.85; varsayilan bu araligin alt ucuna
+    # ayarlandi. Cok kati gelirse (mesru sorgular bos donuyorsa) .env'den
+    # dusurulur, cok gevsekse yukseltilir - kod degisikligi gerekmez.
+    # 0.0 = esik tamamen kapali (eski davranis).
+    SEMANTIC_SEARCH_MIN_SCORE: float = 0.80
+    # Otomatik (yukleyicisi bilinmeyen) semantic_index job'lari bu sabit
+    # servis hesabinin id'siyle kuyruga alinir - bkz. migration e1f4a7b2c5d8.
+    # Hesap is_active=False'tur, login/auth akislarinda KULLANILAMAZ.
+    SYSTEM_USER_ID: str = "00000000-0000-0000-0000-000000000001"
+
+    # --- Inbox / ingestion --------------------------------------------
+    #
+    # Yukleme artik iki asamali: POST /photos dosyayi yalnizca inbox'a
+    # yazar (atomic rename ile), DB kaydini ve is kayitlarini AYRI calisan
+    # ingestion dongusu olusturur. Bkz. app/ingestion/main.py.
+    INGESTION_ENABLED: bool = True
+    # Hizli yoklama araligi - yeni dosyayi yakalama gecikmesi. Filesystem
+    # event (watchdog) BILINCLI OLARAK KULLANILMIYOR: yeni bir bagimlilik
+    # getirir, Windows'ta ag/paylasimli dizinlerde guvenilmezdir ve zaten
+    # "sadece event'e guvenme" gereginden dolayi tarama YINE de gerekliydi.
+    # Yerel bir dizinde saniyede bir os.scandir pratikte olculemez maliyet.
+    INGESTION_POLL_INTERVAL_SECONDS: float = 1.0
+    # TAM uzlastirma (reconciliation) araligi: hizli yoklamanin herhangi bir
+    # nedenle atladigi dosyalari ve yarim kalmis islemleri yakalar. Acilista
+    # da BIR KEZ kosar (crash recovery).
+    INGESTION_RECONCILE_INTERVAL_SECONDS: int = 30
+    # Bu suredir dokunulmamis .part dosyasi "olu yukleme" sayilir (istek
+    # ortasinda backend kapanmis) ve failed/ altina alinir. Yavas ag
+    # uzerinden buyuk dosya yuklemesinden UZUN olmali.
+    INGESTION_STALE_PART_SECONDS: int = 1800
+    # Tek turda islenecek en fazla dosya - dongunun uzlastirma/kapanma
+    # kontrollerine donebilmesi icin.
+    INGESTION_BATCH_LIMIT: int = 50
+
+    @field_validator("EMBEDDING_PROVIDER")
+    @classmethod
+    def _validate_embedding_provider(cls, v: str) -> str:
+        if v not in ("local", "bedrock"):
+            raise ValueError(f"Gecersiz EMBEDDING_PROVIDER: {v!r} (local|bedrock)")
+        return v
+
     # Kimlik dogrulama (JWT). SERVICE_KEY kaldirildi - coklu kullanicili
     # sisteme gecisle birlikte her istemci kendi hesabiyla giris yapiyor.
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+
+    # --- CORS -------------------------------------------------------------
+    #
+    # Tarayicidan gelen isteklerde izin verilen Origin listesi (virgulle
+    # ayrilmis). Frontend backend ile AYNI makinede degilse ya da baska bir
+    # cihazdan aciliyorsa, frontend'in servis edildigi tam adres burada
+    # OLMALI - aksi halde tarayici yaniti CORS hatasiyla dusurur.
+    #
+    # Ornekler:
+    #   CORS_ORIGINS=http://localhost:5173
+    #   CORS_ORIGINS=http://192.168.1.50:5173,http://localhost:5173
+    #
+    # NOT: allow_credentials=True oldugu icin "*" JOKER KULLANILAMAZ -
+    # gercek origin(ler) tam yazilmali (sema + host + port birebir).
+    CORS_ORIGINS: str = "http://localhost:5173"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
 
 
 settings = Settings()
