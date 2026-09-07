@@ -23,7 +23,8 @@ logs/
 # (models/ ozellikle: ONNX agirliklari yuzlerce MB - repoyu sisirir)
 uploads/
 foto_sahne/
-models/
+models/*
+!models/README.md
 reports/
 
 # Yerel gelistirme araclari
