@@ -49,11 +49,18 @@ VLM_BASE_URL=http://localhost:1234/v1
 VLM_MODEL=qwen/qwen2.5-vl-7b
 AI_PROVIDER=lm_studio        # veya "bedrock"
 JWT_SECRET=uzun-rastgele-bir-deger
+CORS_ORIGINS=http://localhost:5173
 ```
 
 `AI_PROVIDER=bedrock` seçilirse AWS kimlik bilgileri `.env`'de TUTULMAZ —
 boto3'un standart kimlik bilgisi zinciri kullanılır (`~/.aws/credentials`,
 ortam değişkenleri veya IAM rolü). Bkz. `AWS_REGION` / `AWS_BEDROCK_MODEL_ID`.
+
+`CORS_ORIGINS` frontend'in servis edildiği origin(ler)i belirtir (virgülle
+ayrılmış, `allow_credentials=True` olduğu için `*` joker karakteri
+KULLANILAMAZ). Frontend backend ile aynı makinede değilse — ör. on-prem LAN
+üzerinden başka bir cihazdan açılıyorsa — bkz. aşağıdaki
+[LAN Üzerinden Erişim](#lan-üzerinden-erişim-on-prem).
 
 ## Veritabanı Migrasyonları
 
@@ -98,6 +105,37 @@ uvicorn app.main:app --reload --reload-dir app --port 8001
 > (yeniden başlatmadan temizlenememesi) nedeniyle kalıcı olarak taşındı.
 > Frontend'in `VITE_API_URL` değeri bununla eşleşmeli.
 
+### LAN Üzerinden Erişim (on-prem)
+
+Frontend backend ile **aynı makinede değilse** (ör. ofis ağındaki başka bir
+bilgisayardan veya telefon/tablet'ten açılıyorsa), aşağıdaki **üçü birden**
+gerekir — biri eksikse bağlantı sessizce başarısız olur ya da CORS hatası
+verir:
+
+1. **Backend tüm arayüzlerde dinlemeli** — varsayılan `uvicorn` yalnızca
+   `127.0.0.1`'i dinler, bu LAN'daki başka bir cihazdan **erişilemez**.
+   `--host 0.0.0.0` eklenmeli:
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8001
+   ```
+   `--reload` ile geliştirme modunda kullanıyorsanız:
+   ```bash
+   uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port 8001
+   ```
+   (`start-photoai.bat` şu an bunu **içermiyor** — LAN erişimi için o
+   script'teki backend komutuna da `--host 0.0.0.0` eklenmeli.)
+2. **`CORS_ORIGINS` frontend'in gerçek LAN adresini içermeli** — backend'i
+   çalıştıran makinenin LAN IP'sini `ipconfig` ile öğrenip frontend'in o
+   adresten servis edildiğini varsayarak yazın:
+   ```
+   CORS_ORIGINS=http://192.168.1.50:5173,http://localhost:5173
+   ```
+3. **Frontend'in `VITE_API_URL`'i backend'in LAN IP'sine işaret etmeli** —
+   `http://localhost:8001` değil, `http://192.168.1.50:8001` gibi.
+
+Windows Güvenlik Duvarı ilk bağlantıda 8001 portu için izin isteyebilir —
+"Özel ağlar" (Private networks) için izin verin.
+
 Fotoğraf yükleme **üç aşamalı** ve hiçbir aşamada senkron AI işlemesi yok:
 
 ```
@@ -123,11 +161,14 @@ yarım kalmış işlemler uzlaştırılır. `INGESTION_ENABLED=false` ile kapat�
 kalıcılaşır, ingestion onu tek tek işler ve worker'lar hemen alabilir —
 upload ile işleme eşzamanlı ilerler.
 
-Worker süreçlerinin ayrıca çalışıyor olması gerekir:
+Worker süreçlerinin **üçü de** ayrıca, ayrı pencerelerde çalışıyor olması
+gerekir — biri eksikse ilgili iş tipi kuyrukta `queued` durumunda takılı
+kalır:
 
 ```bash
-set JOB_TYPES=vlm_analysis  && python -m app.worker.main   # worker-vlm
-set JOB_TYPES=face_pipeline && python -m app.worker.main   # worker-face
+set JOB_TYPES=vlm_analysis   && python -m app.worker.main   # worker-vlm
+set JOB_TYPES=face_pipeline  && python -m app.worker.main   # worker-face
+set JOB_TYPES=semantic_index && python -m app.worker.main   # worker-semantic
 ```
 
 `JOB_TYPES` boş/geçersiz olursa worker **açılışta reddeder** (yanlış
@@ -135,7 +176,20 @@ yapılandırılmış bir worker'ın sessizce başka tipte iş çekmesini önleme
 için). Kaç worker süreci açılacağı `WORKER_VLM_PROCESSES` /
 `WORKER_FACE_PROCESSES` ile kontrol edilir — `WORKER_FACE_PROCESSES` 1'in
 üzerine çıkmadan önce `app/db/jobs_repository.py` başındaki not ve
-`app/db/identity_locks.py` / `app/db/locks.py` okunmalı.
+`app/db/identity_locks.py` / `app/db/locks.py` okunmalı. `worker-semantic`
+için ayrı bir süreç-sayısı ayarı yok (tek süreç yeterli — model küçük,
+GPU'yu VLM ile paylaşmıyor).
+
+`worker-semantic`, `vlm_analysis` işi **başarıyla** bittikten sonra
+otomatik kuyruğa yazılan `semantic_index` işlerini tüketir; VLM analizi
+JSON'unu embed edip Qdrant `photo_semantic` koleksiyonuna yazar
+(`SEMANTIC_SEARCH_ENABLED=false` ise gerekmez).
+
+Qdrant ve frontend'in ayrıca çalışıyor olması gerekir — bunlar bu repo'nun
+parçası değildir; `..\start-photoai.bat` hepsini birlikte başlatır (bkz.
+[Çalıştırma](#çalıştırma) üstü) ya da elle: Qdrant için `qdrant.exe`'yi
+**kendi klasöründen** çalıştırın, frontend için `photoai-frontend`
+dizininde `npm run dev`.
 
 Kurulumun doğru gittiğini kontrol etmek için:
 
