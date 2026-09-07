@@ -122,8 +122,10 @@ verir:
    ```bash
    uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port 8001
    ```
-   (`start-photoai.bat` şu an bunu **içermiyor** — LAN erişimi için o
-   script'teki backend komutuna da `--host 0.0.0.0` eklenmeli.)
+   `start-photoai.bat` bunu **zaten içerir** — script'in backend komutu
+   `--host 0.0.0.0` ile başlar, elle eklemeniz gerekmez. Yalnızca
+   backend'i script dışında (`uvicorn ...` komutunu doğrudan) elle
+   başlatıyorsanız bu bayrağı kendiniz eklemelisiniz.
 2. **`CORS_ORIGINS` frontend'in gerçek LAN adresini içermeli** — backend'i
    çalıştıran makinenin LAN IP'sini `ipconfig` ile öğrenip frontend'in o
    adresten servis edildiğini varsayarak yazın:

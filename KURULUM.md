@@ -5,7 +5,8 @@
 > ortam değişkeni ve komut, repository'deki gerçek koddan (`requirements.txt`,
 > `app/core/settings.py`, `app/worker/main.py`, `alembic/`, `.env.example`) doğrulanmıştır.
 >
-> **Referans commit:** `cd09a73` — *feat: yapılandırılabilir CORS + asenkron upload/ingestion hattı + worker gözlemi*
+> **Referans commit:** `ecaa621` — on-prem LAN erişimi (backend `--host 0.0.0.0`,
+> `CORS_ORIGINS`, frontend `VITE_API_URL`) dahil güncel.
 
 ---
 
@@ -25,6 +26,7 @@
 12. [Adım 9 — Alembic Migration'ları](#adım-9--alembic-migrationları)
 13. [Adım 10 — İlk Admin Hesabı](#adım-10--i̇lk-admin-hesabı)
 14. [Adım 11 — Backend'i Başlatma](#adım-11--backendi-başlatma)
+    - [LAN Üzerinden Erişim (on-prem)](#lan-üzerinden-erişim-on-prem)
 15. [Adım 12 — Worker Süreçlerini Başlatma](#adım-12--worker-süreçlerini-başlatma)
 16. [Adım 13 — Kurulumun Doğrulanması](#adım-13--kurulumun-doğrulanması)
 17. [Adım 14 — Testlerin Çalıştırılması (opsiyonel)](#adım-14--testlerin-çalıştırılması-opsiyonel)
@@ -915,6 +917,51 @@ Windows'ta port 8000 bazen "hayalet dinleyici" hâlinde takılı kalıyor
 Backend bu yüzden **kalıcı olarak 8001'e** taşındı. Frontend'in `VITE_API_URL`
 değeri bununla **eşleşmelidir**.
 
+### LAN Üzerinden Erişim (on-prem)
+
+Frontend backend ile **aynı makinede değilse** — ör. ofis ağındaki başka bir
+bilgisayardan ya da telefon/tablet'ten açılıyorsa — aşağıdaki **üçü birden**
+gerekir. Biri eksikse bağlantı ya TCP aşamasında sessizce zaman aşımına uğrar
+ya da CORS hatasıyla düşer:
+
+1. **Backend tüm ağ arayüzlerinde dinlemeli.** Varsayılan `uvicorn` yalnızca
+   `127.0.0.1`'i dinler — bu, LAN'daki başka bir cihazdan **erişilemez**
+   demektir (bağlantı isteği backend'e hiç ulaşmaz, CORS devreye bile
+   girmez). `--host 0.0.0.0` eklenmeli:
+   ```powershell
+   # Gelistirme (--reload ile)
+   uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port 8001
+
+   # Uretim
+   uvicorn app.main:app --host 0.0.0.0 --port 8001
+   ```
+   `start-photoai.bat` bunu **zaten içerir** — script'in backend komutu
+   `--host 0.0.0.0` ile başlar (bkz. [Tüm Servisleri Tek Komutla
+   Başlatma](#tüm-servisleri-tek-komutla-başlatma)); script kullanıyorsanız
+   elle eklemeniz gerekmez. Yalnızca `uvicorn` komutunu **doğrudan** elle
+   çalıştırıyorsanız bu bayrağı kendiniz eklemelisiniz.
+2. **`CORS_ORIGINS` frontend'in gerçek LAN adresini içermeli.** Backend'i
+   çalıştıran makinenin LAN IP'sini `ipconfig` ile öğrenip (`.env`):
+   ```ini
+   CORS_ORIGINS=http://192.168.1.50:5173,http://localhost:5173
+   ```
+3. **Frontend'in `VITE_API_URL`'i backend'in LAN IP'sine işaret etmeli** —
+   `photoai-frontend/.env` içinde `http://localhost:8001` **değil**,
+   `http://192.168.1.50:8001` gibi backend'i çalıştıran makinenin ağ adresi
+   yazılmalı. `localhost` istemci cihazın kendisini işaret eder, sunucuyu
+   değil — bu adresle açıldığında istek hiçbir yere gitmez.
+
+Windows Güvenlik Duvarı ilk LAN bağlantısında 8001 (backend) ve 5173
+(frontend) portları için izin isteyebilir — **"Özel ağlar" (Private
+networks)** için izin verin; "Genel ağlar" (Public networks) seçilmemeli.
+
+> Bu üç madde birbirinden **bağımsız arızalanır** — sorun giderirken hangi
+> aşamada takıldığınızı ayırt edin: tarayıcı isteği hiç göndermiyorsa/zaman
+> aşımına uğruyorsa (1), konsolda CORS hatası görüyorsanız (2), istek
+> gidiyor ama yanlış adrese gidiyorsa (3). Bkz.
+> [K12](#k12-tarayıcıda-cors-hatası-has-been-blocked-by-cors-policy) ve
+> [K23](#k23-landa-başka-bir-cihazdan-bağlantı-kurulamıyor-cors-hatası-bile-gelmiyor).
+
 ---
 
 ## Adım 12 — Worker Süreçlerini Başlatma
@@ -1170,20 +1217,26 @@ Script'in yaptıkları (sırayla):
 | Adım | Servis | Komut / Pencere adı |
 |---|---|---|
 | 1 | **Qdrant** | `C:\qdrant` içinde `qdrant.exe` — 6333 dinleniyorsa atlanır, 6 sn beklenir |
-| 2 | **Backend** | `uvicorn app.main:app --reload --reload-dir app --port 8001` — *"PhotoAI Backend"* |
+| 2 | **Backend** | `uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port 8001` — *"PhotoAI Backend"* |
 | 2b | *(Ingestion)* | **Ayrı pencere gerekmez** — backend süreci içinde arka plan thread'i |
 | 3a | **worker-vlm** | `set JOB_TYPES=vlm_analysis && python -m app.worker.main` — *"PhotoAI Worker VLM"* |
 | 3b | **worker-face** | `set JOB_TYPES=face_pipeline && python -m app.worker.main` — *"PhotoAI Worker Face"* |
 | 3c | **worker-semantic** | `set JOB_TYPES=semantic_index && python -m app.worker.main` — *"PhotoAI Worker Semantic"* |
 | 4 | **Frontend** | `npm run dev` (photoai-frontend) |
 
+> Backend komutu `--host 0.0.0.0` içerir — yalnızca `127.0.0.1` değil, tüm
+> ağ arayüzlerinde dinler. Bu, LAN'daki başka bir cihazın backend'e
+> **erişebilmesi** için zorunludur (bkz. [LAN Üzerinden Erişim
+> (on-prem)](#lan-üzerinden-erişim-on-prem)); yalnızca bu makineden
+> kullanılacaksa da bir zararı yoktur, kaldırmanıza gerek yok.
+
 Başlatma sonrası adresler:
 
-| Servis | Adres |
-|---|---|
-| Qdrant Dashboard | http://127.0.0.1:6333/dashboard |
-| Backend (Swagger) | http://localhost:8001/docs |
-| Frontend | http://localhost:5173 |
+| Servis | Adres | LAN'dan |
+|---|---|---|
+| Qdrant Dashboard | http://127.0.0.1:6333/dashboard | — (yalnızca yerel) |
+| Backend (Swagger) | http://localhost:8001/docs | `http://<backend-ip>:8001/docs` |
+| Frontend | http://localhost:5173 | `http://<backend-ip>:5173` (`vite.config.ts`'te `host: true`) |
 
 > Ingestion'ı ayrı bir sürece almak isterseniz: `.env`'de
 > `INGESTION_ENABLED=false` yapıp `python -m app.ingestion.main` çalıştırın.
@@ -1224,7 +1277,7 @@ tanımsız anahtarlar yok sayılır (`extra="ignore"`).
 
 | Değişken | Varsayılan | Not |
 |---|---|---|
-| `CORS_ORIGINS` | `http://localhost:5173` | Virgülle ayrılmış; `*` **kullanılamaz** |
+| `CORS_ORIGINS` | `http://localhost:5173` | Virgülle ayrılmış; `*` **kullanılamaz**. LAN'da başka bir cihazdan erişimde bu **tek başına yetmez** — bkz. [LAN Üzerinden Erişim](#lan-üzerinden-erişim-on-prem) |
 
 ### Yüz tanıma & Qdrant
 
@@ -1353,6 +1406,13 @@ Sırayla işaretleyin:
 - [ ] `POST /auth/login` token döndürüyor
 - [ ] Örnek fotoğraf yüklendi → **202** → işler `done` oldu → `GET /photos` analizli döndü
 - [ ] `curl http://127.0.0.1:6333/collections` → `faces`, `identity_pool`, `photo_semantic`
+
+### LAN üzerinden erişim (yalnızca başka bir cihazdan kullanılacaksa)
+- [ ] Backend `--host 0.0.0.0` ile başlatıldı (`start-photoai.bat` bunu zaten yapar)
+- [ ] `CORS_ORIGINS` backend'i çalıştıran makinenin LAN IP'sindeki frontend adresini içeriyor
+- [ ] Frontend'in `VITE_API_URL`'i `localhost` değil, backend'in LAN IP'sine işaret ediyor
+- [ ] Windows Güvenlik Duvarı'nda 8001 ve 5173 "Özel ağlar" için izinli
+- [ ] Başka bir cihazdan `http://<backend-ip>:8001/docs` açılabiliyor
 
 ---
 
@@ -1519,6 +1579,11 @@ CORS_ORIGINS=http://192.168.1.50:5173,http://localhost:5173
 ```
 Backend'i yeniden başlatın.
 
+> Bu hata yalnızca istek backend'e **ulaştığında** görülür. LAN üzerinden
+> hiç istek gitmiyormuş gibi görünüyorsa (konsolda CORS mesajı bile yok,
+> yalnızca zaman aşımı/`ERR_CONNECTION_TIMED_OUT`) bkz.
+> [K23](#k23-landa-başka-bir-cihazdan-bağlantı-kurulamıyor-cors-hatası-bile-gelmiyor).
+
 ---
 
 ### K13. Frontend backend'e ulaşamıyor / 404
@@ -1634,6 +1699,37 @@ artırın.
 temizlenemiyor, yalnızca yeniden başlatma çözüyor.
 
 **Çözüm:** Backend zaten **kalıcı olarak 8001**'e taşınmıştır. 8000 kullanmayın.
+
+---
+
+### K23. LAN'da başka bir cihazdan bağlantı kurulamıyor (CORS hatası bile gelmiyor)
+
+**Belirti:** Aynı ağdaki başka bir bilgisayar/telefondan frontend'i açtığınızda
+istekler `ERR_CONNECTION_TIMED_OUT` / `ERR_CONNECTION_REFUSED` ile başarısız
+oluyor — tarayıcı konsolunda CORS mesajı **görünmüyor** (istek backend'e hiç
+ulaşmıyor, CORS kontrolü devreye girmiyor).
+
+**Neden:** `uvicorn` varsayılan olarak yalnızca `127.0.0.1`'i (yerel makine)
+dinler. `--host` bayrağı verilmemişse backend, ağdaki başka hiçbir cihazdan
+görünmez — bu, `CORS_ORIGINS` doğru yazılmış olsa bile geçerlidir.
+
+**Çözüm:** Backend'i `--host 0.0.0.0` ile başlatın:
+```powershell
+uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port 8001
+```
+`start-photoai.bat` kullanıyorsanız bu zaten dahildir — script'i doğrudan
+elle çalıştırdığınız için bu hatayı alıyorsanız bayrağı eklemeyi unutmuşsunuzdur.
+
+**Kontrol listesi (üçü de gerekli, bkz. [Adım 11 — LAN Üzerinden
+Erişim](#lan-üzerinden-erişim-on-prem)):**
+1. Backend `--host 0.0.0.0` ile çalışıyor mu?
+2. `CORS_ORIGINS` frontend'in LAN adresini içeriyor mu?
+3. Frontend'in `VITE_API_URL`'i backend'in LAN IP'sine mi işaret ediyor
+   (`localhost` değil)?
+
+Ayrıca Windows Güvenlik Duvarı'nda 8001 ve 5173 portlarının **Özel ağlar**
+için izinli olduğunu doğrulayın — ilk bağlantıda çıkan izin isteğini
+kapatmışsanız `wf.msc` üzerinden elle ekleyebilirsiniz.
 
 ---
 
