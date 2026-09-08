@@ -7,6 +7,34 @@ yüzleri kümeler/eşler. Her iki analiz de senkron HTTP isteği içinde DEĞİL
 PostgreSQL tabanlı bir **iş kuyruğu** üzerinden arka planda çalışan ayrı
 worker süreçleriyle yürür.
 
+## Hızlı Başlangıç
+
+Repoyu ilk kez klonlayan bir geliştirici için en kısa yol:
+
+```powershell
+cd C:\Users\<kullanici>\Desktop
+git clone <repository-url> photoai-backend
+cd photoai-backend
+git checkout dev-busra-photoai   # varsayilan (main) branch'te degilseniz
+
+.\setup.bat
+```
+
+`setup.bat` venv, bağımlılıklar, PostgreSQL (kurulu değilse **otomatik
+kurar** — Yönetici Onayı/UAC ister), veritabanı, Qdrant, model dosyaları,
+`.env` ve migration'ları otomatik kurar — idempotenttir, mevcut `.env`'in
+üzerine yazmaz. Detay/parametreler için [`KURULUM-HIZLI.md`](KURULUM-HIZLI.md);
+her adımın gerekçesi ve hata çözümleri için [`KURULUM.md`](KURULUM.md).
+
+Script sonrasında elle yapılması gerekenler: LM Studio kurup VLM modelini
+indirmek (ya da AWS Bedrock için `.env`'i düzenlemek) ve servisleri
+başlatmak (bkz. [Çalıştırma](#çalıştırma)).
+
+Ön koşul olarak yalnızca Python 3.11.x ve (GPU'lu kurulum için) güncel bir
+NVIDIA sürücüsünün elle kurulu olması gerekir — script bunları kurmaz,
+varlığını kontrol eder. PostgreSQL'i elle kurmak isterseniz
+`setup.bat -SkipPgInstall`.
+
 ## Özellikler
 
 - Fotoğraf yükleme (JPEG, PNG, WEBP, HEIC) + içerik hash'iyle duplicate tespiti
@@ -32,6 +60,9 @@ worker süreçleriyle yürür.
 - VLM sağlayıcısı: yerel LM Studio **veya** AWS Bedrock erişimi
 
 ## Kurulum
+
+> Otomatik yol için yukarıdaki [Hızlı Başlangıç](#hızlı-başlangıç) (`setup.bat`)
+> bölümüne bakın. Aşağıdaki adımlar manuel/elle kurulum içindir.
 
 ```bash
 python -m venv venv

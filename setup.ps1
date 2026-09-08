@@ -8,6 +8,12 @@
     olan opsiyonel adimlar (DB, Qdrant indirme) scripti durdurmaz - uyari
     basip devam eder, sonda ozet gosterir.
 
+    PostgreSQL kurulu degilse EDB'nin resmi installer'ini (unattended mod)
+    indirip kurar - bunun icin YONETICI ONAYI (UAC) ister; parola installer'a
+    komut satiri argumani olarak gecilir (EDB'nin resmi --superpassword
+    mekanizmasi budur), kurulum sirasinda process komut satirinda kisaca
+    gorunur olabilir.
+
     AWS/Bedrock kimlik bilgilerine hic DOKUNMAZ (boto3 kendi zincirini
     kullanir - bkz. README.md). Bu script sadece LOKAL dosya/DB kurulumunu
     otomatize eder.
@@ -24,7 +30,12 @@
     ya da Docker/baska bir makinede calisiyorsa).
 
 .PARAMETER SkipDb
-    PostgreSQL veritabani olusturma adimini atlar.
+    PostgreSQL veritabani olusturma adimini atlar (kurulumu da).
+
+.PARAMETER SkipPgInstall
+    PostgreSQL zaten kurulu degilse OTOMATIK KURMAYI atlar (sadece DB
+    olusturmayi degil) - PostgreSQL'in elle kurulacagi durumlar icin.
+    Yonetici (admin) onayi/UAC istemeden calismasi gerekenler bunu kullanmali.
 
 .PARAMETER Lan
     .env olusturulurken CORS_ORIGINS icin LAN adresi de sorar
@@ -40,12 +51,20 @@ param(
     [switch]$SkipModels,
     [switch]$SkipQdrant,
     [switch]$SkipDb,
+    [switch]$SkipPgInstall,
     [switch]$Lan
 )
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
+
+# PostgreSQL otomatik-kurulum surumu - periyodik olarak guncel bir surume
+# bumplenmeli (bkz. https://www.enterprisedb.com/downloads/postgres-postgresql-downloads).
+# Dogrulama: bu URL'in HTTP 200 dondugu 2026-09-08'de kontrol edildi.
+$PgInstallerVersion = "17.7-1"
+$PgMajorVersion = "17"
+$PgInstallerUrl = "https://get.enterprisedb.com/postgresql/postgresql-$PgInstallerVersion-windows-x64.exe"
 
 $warnings = New-Object System.Collections.Generic.List[string]
 
@@ -108,23 +127,81 @@ if (-not $torchInstalled) {
 $cudaAvailable = (python -c "import torch; print(torch.cuda.is_available())") 2>$null
 Write-Ok "torch hazir (cuda: $cudaAvailable)"
 
-# --- 3) PostgreSQL veritabani ---------------------------------------------
+# --- 3) PostgreSQL (kurulum + veritabani) ----------------------------------
 $dbPassword = $null
-Write-Step 3 "PostgreSQL veritabani"
+Write-Step 3 "PostgreSQL"
 if ($SkipDb) {
     Write-Skip "-SkipDb verildi"
 } else {
-    $psql = Get-Command psql -ErrorAction SilentlyContinue
-    if (-not $psql) {
-        $found = Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\psql.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) { $env:Path += ";$($found.DirectoryName)"; $psql = Get-Command psql -ErrorAction SilentlyContinue }
+    function Find-Psql {
+        $cmd = Get-Command psql -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        $found = Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\psql.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($found) {
+            $env:Path += ";$($found.DirectoryName)"
+            return $found.FullName
+        }
+        return $null
     }
-    if (-not $psql) {
-        Write-Warn2 "psql bulunamadi - veritabanini elle olusturun: CREATE DATABASE photoai_db;"
-    } else {
-        $secure = Read-Host "PostgreSQL 'postgres' kullanici parolasi" -AsSecureString
+
+    $psqlPath = Find-Psql
+    $freshInstall = $false
+
+    if (-not $psqlPath -and -not $SkipPgInstall) {
+        Write-Host "  PostgreSQL bulunamadi - otomatik kurulum baslatilacak (surum $PgInstallerVersion)." -ForegroundColor DarkCyan
+        Write-Host "  Kurulum icin YONETICI ONAYI (UAC) istenecek." -ForegroundColor DarkCyan
+        $secure = Read-Host "  Yeni 'postgres' super kullanicisi icin bir parola belirleyin" -AsSecureString
         $dbPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+        try {
+            $installerPath = Join-Path $env:TEMP "postgresql-$PgInstallerVersion-windows-x64.exe"
+            if (-not (Test-Path $installerPath)) {
+                Write-Host "  Indiriliyor: $PgInstallerUrl" -ForegroundColor DarkCyan
+                Invoke-WebRequest -Uri $PgInstallerUrl -OutFile $installerPath
+            }
+            $installArgs = @(
+                "--mode", "unattended",
+                "--unattendedmodeui", "minimal",
+                "--superpassword", $dbPassword,
+                "--serverport", "5432",
+                "--servicename", "postgresql-x64-$PgMajorVersion"
+            )
+            Write-Host "  Kuruluyor (birkac dakika surebilir)..." -ForegroundColor DarkCyan
+            $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -Verb RunAs -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+                throw "Installer exit code: $($proc.ExitCode)"
+            }
+            $env:Path += ";C:\Program Files\PostgreSQL\$PgMajorVersion\bin"
+            $freshInstall = $true
+            Write-Ok "PostgreSQL $PgMajorVersion kuruldu"
+
+            # Servis ayaga kalkana kadar kisa bir bekleme/deneme dongusu.
+            $ready = $false
+            for ($i = 0; $i -lt 10 -and -not $ready; $i++) {
+                Start-Sleep -Seconds 2
+                $env:PGPASSWORD = $dbPassword
+                & psql -U postgres -tAc "SELECT 1" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $ready = $true }
+            }
+            if (-not $ready) { Write-Warn2 "PostgreSQL servisi kurulumdan sonra hazir olmadi - birkac saniye sonra tekrar deneyin." }
+            $psqlPath = "psql"
+        } catch {
+            Write-Warn2 "PostgreSQL otomatik kurulumu basarisiz: $($_.Exception.Message) - elle kurun: https://www.enterprisedb.com/downloads/postgres-postgresql-downloads"
+            $psqlPath = $null
+        }
+    } elseif (-not $psqlPath -and $SkipPgInstall) {
+        Write-Warn2 "psql bulunamadi (-SkipPgInstall verildi) - veritabanini elle olusturun: CREATE DATABASE photoai_db;"
+    } else {
+        Write-Skip "PostgreSQL zaten kurulu ($psqlPath)"
+    }
+
+    if ($psqlPath) {
+        if (-not $freshInstall) {
+            $secure = Read-Host "PostgreSQL 'postgres' kullanicisinin MEVCUT parolasi" -AsSecureString
+            $dbPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+        }
         $env:PGPASSWORD = $dbPassword
         try {
             $exists = & psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='photoai_db'" 2>$null

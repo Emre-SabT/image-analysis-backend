@@ -22,13 +22,20 @@ yazmaz. `.env` içindeki `DATABASE_URL` ve `JWT_SECRET` otomatik doldurulur;
 Bedrock kullanacaksanız `.env`'i script sonrasında elle düzenleyin (AWS
 kimlik bilgileri script tarafından hiç okunmaz/dokunulmaz).
 
-Parametreler: `setup.bat -Cpu` (CUDA yerine CPU-only), `-SkipQdrant`,
-`-SkipDb`, `-SkipModels` (zaten kuruluysa), `-Lan` (LAN erişimi için
-`CORS_ORIGINS`'i de sorar). Detay: `setup.ps1` başındaki yorum bloğu.
+**PostgreSQL kurulu değilse otomatik kurar** (EDB'nin resmi installer'ı,
+sessiz mod) — bunun için **Yönetici Onayı (UAC)** ister; 'postgres' süper
+kullanıcısının parolasını sizden ister ve onu belirler. PostgreSQL'i elle
+kurmak isterseniz `-SkipPgInstall` (veritabanı oluşturmayı da tamamen
+atlamak için `-SkipDb`).
 
-Script'in **yapmadıkları** (elle gerekir): PostgreSQL/Git/Python kurulumunun
-kendisi, LM Studio'da model indirme, `aws configure`, servisleri başlatma
-(bkz. [Adım 10](#10-başlatma--4-ayrı-pencere)).
+Parametreler: `setup.bat -Cpu` (CUDA yerine CPU-only), `-SkipQdrant`,
+`-SkipDb`, `-SkipPgInstall`, `-SkipModels` (zaten kuruluysa), `-Lan` (LAN
+erişimi için `CORS_ORIGINS`'i de sorar). Detay: `setup.ps1` başındaki
+yorum bloğu.
+
+Script'in **yapmadıkları** (elle gerekir): Git/Python kurulumunun kendisi,
+LM Studio'da model indirme, `aws configure`, servisleri başlatma (bkz.
+[Adım 10](#10-başlatma--4-ayrı-pencere)).
 
 ## Elle, adım adım
 
